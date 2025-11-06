@@ -11,6 +11,7 @@
 #include <sys/uio.h>
 #include <sys/user.h> // for PAGE_SIZE
 #include <unistd.h>
+#include <vector>
 
 #include "memsetting.h"
 
@@ -50,6 +51,9 @@ public:
 
     template <typename S>
     static long readv(S addr, void *data, size_t size);
+
+    static long readv_batch(const std::vector<std::pair<size_t, size_t>> &addr_size_pairs,
+                            std::vector<void *> &buffers);
 
 
     template <typename T, typename... Args>
@@ -111,6 +115,25 @@ inline long memtool::base::readv(S addr, void *data, size_t size)
    long result= syscall(SYS_process_vm_readv, target_pid, mem_local, 1, mem_remote, 1, 0);
    
     return result;
+}
+
+// 优化为批量读取
+inline long
+memtool::base::readv_batch(const std::vector<std::pair<size_t, size_t>> &addr_size_pairs,
+            std::vector<void *> &buffers) {
+  constexpr size_t MAX_IOV = 256; // 内核限制
+  std::vector<iovec> local(std::min(addr_size_pairs.size(), MAX_IOV));
+  std::vector<iovec> remote(std::min(addr_size_pairs.size(), MAX_IOV));
+
+  for (size_t i = 0; i < std::min(addr_size_pairs.size(), MAX_IOV); ++i) {
+    local[i].iov_base = buffers[i];
+    local[i].iov_len = addr_size_pairs[i].second;
+    remote[i].iov_base = reinterpret_cast<void *>(addr_size_pairs[i].first);
+    remote[i].iov_len = addr_size_pairs[i].second;
+  }
+
+  return syscall(SYS_process_vm_readv, target_pid, local.data(), local.size(),
+                 remote.data(), remote.size(), 0);
 }
 
 template <typename T, typename... Args>

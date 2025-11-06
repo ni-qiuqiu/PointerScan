@@ -260,6 +260,67 @@ void chainer::scan<T>::integr_data_to_file(std::vector<utils::mapqueue<chainer::
 }
 
 template <class T>
+void chainer::scan<T>::integr_data_to_txt(std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<chainer::pointer_range<T>> &ranges, FILE *f)
+{
+    if (f == nullptr || ranges.empty())
+        return;
+
+    char buf[1024];
+    std::atomic_size_t total_count(0);
+
+    // 递归输出指针链的辅助函数
+    auto out_chain_recursive = [&contents](FILE *out_f, char *buffer, int level, chainer::pointer_dir<T> *dat) {
+        auto impl = [&contents](FILE *out_f, char *buffer, int level, chainer::pointer_dir<T> *dat, auto &impl_ref) -> size_t {
+            if (level == 0) {
+                // 到达最底层，输出完整链
+                strcat(buffer, "\n");
+                fwrite(buffer, strlen(buffer), 1, out_f);
+                return 1;
+            } else {
+                size_t count = 0;
+                char *current_pos = buffer + strlen(buffer);
+                
+                // 遍历当前节点索引的所有子节点
+                for (auto i = dat->start; i < dat->end; ++i) {
+                    *current_pos = 0;  // 重置当前位置
+                    auto *child = contents[level - 1][i];
+                    
+                    // 添加偏移信息
+                    auto n = sprintf(current_pos, " -> + 0x%lX", (size_t)(child->address - dat->value));
+                    count += impl_ref(out_f, buffer, level - 1, child, impl_ref);
+                }
+                return count;
+            }
+        };
+        return impl(out_f, buffer, level, dat, impl);
+    };
+
+    // 遍历每个模块范围
+    for (auto &r : ranges) {
+        printf("Writing chains for %s[%d] at level %d, count: %ld\n", 
+               r.vma->name, r.vma->count, r.level, r.results.size());
+        
+        // 遍历该模块中的每个指针数据
+        for (auto &dat : r.results) {
+            *buf = 0;
+            
+            // 输出起始部分: 模块名[编号] + 0x偏移
+            auto n = sprintf(buf, "%s[%d] + 0x%lX", 
+                           r.vma->name, 
+                           r.vma->count, 
+                           (size_t)(dat.address - r.vma->start));
+            
+            // 递归输出完整的指针链
+            auto count = out_chain_recursive(f, buf, r.level, &dat);
+            total_count += count;
+        }
+    }
+
+    fflush(f);
+    printf("Total chains written to txt: %ld\n", total_count.load());
+}
+
+template <class T>
 chainer::chain_info<T> chainer::scan<T>::build_pointer_dirs_tree(std::vector<utils::mapqueue<chainer::pointer_dir<T>>> &dirs, std::vector<chainer::pointer_range<T>> &ranges)
 {
     std::vector<std::vector<chainer::pointer_range<T> *>> rmaps(dirs.size());

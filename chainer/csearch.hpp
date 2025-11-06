@@ -61,6 +61,16 @@ void chainer::search<T>::filter_pointer_to_fmmap(char *buffer, T start,
         fclose(f), f = nullptr;
         return;
     }
+    // std::vector<std::pair<size_t, size_t>> addr_size_pairs;
+    // addr_size_pairs.emplace_back(start, len);
+    // std::vector<void *> buffers;
+    // buffers.emplace_back(buffer);
+    // if (memtool::extend::readv_batch(addr_size_pairs, buffers) == -1)
+    // {
+    //     fclose(f), f = nullptr;
+    //     return;
+    // }
+
 
     output_pointer_to_file(f, (T *)buffer, start, len / sizeof(T), min, sub);
 

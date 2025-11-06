@@ -16,6 +16,10 @@ struct cscan : public ::chainer::scan<T>
         bool limit, size_t plim, FILE *outstream);
     //addr为指针地址列表 depth为深度 offset为偏移 limit为限制 plim为限制大小 outstream为输出文件
 
+ 
+    size_t scan_pointer_chain_to_txt(std::vector<T> &addr, int depth,
+      size_t offset, bool limit, size_t plim, FILE *outstream);
+    //将指针链转为文本格式输出到outstream中
     cscan();
 
     ~cscan();

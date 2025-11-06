@@ -69,9 +69,6 @@ public:
 
   static int det_mem_range(char *name, char *prems);
 
-  // template <typename F>
-  // static int parse_process_maps(char *path, F &&call);
-
   static int parse_process_maps();
 
   static int parse_process_module();

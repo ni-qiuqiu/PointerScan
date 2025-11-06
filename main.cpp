@@ -13,7 +13,7 @@ using namespace utils;
 int main(int argc, char *argv[]) {
   // 创建命令行解析器
   CommandLineParser parser("newscan", "高性能内存指针链分析工具");
-
+{
   // 添加命令行选项
   parser.addOption({'p', "process", "目标进程名称或PID", true, true});
   parser.addOption(
@@ -41,6 +41,8 @@ int main(int argc, char *argv[]) {
     parser.showHelp();
     return 0;
   }
+
+}
 
   // 获取目标进程
   std::string targetProcess = parser.getOptionValue("process");
@@ -79,12 +81,25 @@ int main(int argc, char *argv[]) {
   auto endTime = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       endTime - startTime);
-  printf("Time taken: %ld milliseconds\n", duration.count());
+  printf("Time taken: %lld milliseconds\n", static_cast<long long>(duration.count()));
 
   uint64_t addr = std::stoull(parser.getOptionValue("address"), nullptr, 16);
   std::vector<size_t> addrs;
   addrs.emplace_back(addr);
 
+  //直接输出文本格式（推荐方式，避免中间二进制文件转换）
+  std::string outputFile = parser.getOptionValue("file","pointer_chains.txt");
+  auto f_txt = fopen(outputFile.c_str(), "wb+");//支持创建和写入
+  if (f_txt == nullptr) {
+    std::cerr << "错误: 无法创建输出文件: " << outputFile << std::endl;
+    return 1;
+  }
+  
+  auto chaincount = t.scan_pointer_chain_to_txt(addrs, maxDepth, maxOffset, false, 0, f_txt);
+  printf("chaincount %ld\n", chaincount);
+  fclose(f_txt);
+
+  /* 方式2: 原始二进制格式（需要二次转换）
   auto f = fopen("1", "wb+");
   auto chaincount =
       t.scan_pointer_chain(addrs, maxDepth, maxOffset, false, 0, f);
@@ -99,5 +114,7 @@ int main(int argc, char *argv[]) {
   // 需要在当前目录有2文件夹
 
   fclose(f2);
+  */
+  
   return 0;
 }

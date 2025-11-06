@@ -39,6 +39,8 @@ protected:
 
     void integr_data_to_file(std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<chainer::pointer_range<T>> &ranges, FILE *f);
 
+    void integr_data_to_txt(std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<chainer::pointer_range<T>> &ranges, FILE *f);
+
     chain_info<T> build_pointer_dirs_tree(std::vector<utils::mapqueue<pointer_dir<T>>> &dirs, std::vector<chainer::pointer_range<T>> &ranges);
 }; // about constructor or deconstructor ....
 

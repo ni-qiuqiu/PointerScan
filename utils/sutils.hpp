@@ -61,32 +61,6 @@ inline void utils::free_container_data(T &container)
         delete dat;
 }
 
-template <typename T>
-inline void utils::free_list_data(T list)
-{
-    T head, node;
-    node = list;
-
-    while (node != nullptr) {
-        head = node;
-        node = node->next;
-        delete head;
-    }
-}
-
-template <typename T, typename F>
-void utils::free_list_data(T list, F &&call)
-{
-    T head, node;
-    node = list;
-
-    while (node != nullptr) {
-        head = node;
-        call(node);
-        node = node->next;
-        delete head;
-    }
-}
 
 template <class T, class F, class... Args>
 void utils::free_list_for_each(T list, F &&call, Args &&...args)
@@ -106,20 +80,6 @@ void utils::free_list_for_each(T list, F &&call, Args &&...args)
     }
 }
 
-template <typename F>
-void utils::strtok_name(char *name, const char *sign, F &&call)
-{
-    char *p;
-    char *stok = strstr(name, sign);
-    char *ret = name;
-
-    while (stok != nullptr) {
-        p = ret;
-        ret = stok + 1;
-        stok = strstr(ret, sign);
-        call(ret, stok, p);
-    }
-}
 
 template <typename T>
 constexpr T *utils::address_of(T *x)
@@ -132,3 +92,13 @@ constexpr T *utils::address_of(T &x)
 {
     return &x;
 }
+
+inline void utils::cat_file_to_another(void *buffer, size_t len, FILE *instream, FILE *outstream)
+{
+    size_t size;
+
+    while ((size = fread(buffer, 1, len, instream)) > 0)
+        fwrite(buffer, size, 1, outstream);
+
+    fflush(outstream);
+} // rewind or seek by uself
