@@ -43,7 +43,7 @@ void chainer::search<T>::output_pointer_to_file(FILE *f, T *buffer, T start, siz
 }
 
 template <class T>
-void chainer::search<T>::filter_pointer_to_fmmap(T start, size_t len,
+void chainer::search<T>::filter_pointer_to_fmmap(char *buffer, T start, size_t len,
                     memtool::vm_area_data *vma, FILE *&f)
 {
     f = tmpfile();
@@ -57,12 +57,9 @@ void chainer::search<T>::filter_pointer_to_fmmap(T start, size_t len,
     T max = vm_vec.back()->end;
     T sub = max - min;
 
-    // 使用 BufferPool 获取缓冲区（通过 RAII 自动管理）
-    memtool::BufferGuard buf_guard(*buffer_pool_);
-    char* local_buffer = buf_guard.get();
-
-    // 读取内存数据
-    if (memtool::extend::readv(start, local_buffer, len) == -1) {
+    // 使用传入的缓冲区（由 employ_memory_block 通过 BufferPool 获取）
+    // 避免重复获取缓冲区导致死锁
+    if (memtool::extend::readv(start, buffer, len) == -1) {
         fclose(f);
         f = nullptr;
         return;
@@ -70,10 +67,9 @@ void chainer::search<T>::filter_pointer_to_fmmap(T start, size_t len,
 
     // 输出指针到文件
     size_t element_count = len / sizeof(T);
-    output_pointer_to_file(f, (T *)local_buffer, start, element_count, min, sub);
+    output_pointer_to_file(f, (T *)buffer, start, element_count, min, sub);
 
     fflush(f);
-    // BufferGuard 析构时自动释放缓冲区
 }
 
 
@@ -178,23 +174,23 @@ size_t chainer::search<T>::get_pointers(T start, T end, bool rest, int count,
     return 0;
   }
 
-  // 初始化缓冲区池
-  // 使用线程数 + 2 个缓冲区，确保有足够的缓冲区供多线程使用
-  // 每个缓冲区 1MB，足够扫描使用
-  const uint32_t buffer_len = 1 << 20; // 1MB
-  size_t pool_size = utils::thread_pool ? utils::thread_pool->size() + 2 : 4;
-  buffer_pool_ = std::make_unique<memtool::BufferPool>(pool_size, buffer_len);
-
+  // 注意：BufferPool 会在 for_each_memory_call 内部创建
+  // 这里不需要手动创建，避免重复构造
+  
   // 第一阶段：扫描内存，提取指针到临时文件
   auto fptofile = [this](auto buf, auto mem_start, auto mem_len, auto vma, auto &file) {
-    // buf 参数保持接口兼容性，实际使用 BufferPool 内部获取
-    filter_pointer_to_fmmap(mem_start, mem_len, vma, file);
+    // 使用 employ_memory_block 提供的缓冲区，避免重复获取导致死锁
+    filter_pointer_to_fmmap(buf, mem_start, mem_len, vma, file);
   };
   
   auto file_list = memtool::extend::for_each_memory_area<FILE *>(
       start, end, rest, count, size, fptofile);
 
   // 第二阶段：合并所有临时文件
+  // 为文件合并创建临时缓冲区（使用 RAII 管理）
+  const uint32_t merge_buffer_size = 1 << 20; // 1MB
+  std::unique_ptr<char[]> merge_buffer(new char[merge_buffer_size]);
+  
   for (auto &tmp_file : file_list) {
     if (tmp_file == nullptr) {
       continue;
@@ -202,16 +198,14 @@ size_t chainer::search<T>::get_pointers(T start, T end, bool rest, int count,
 
     rewind(tmp_file);
     
-    // 使用 BufferPool 获取缓冲区来合并文件
-    memtool::BufferGuard buf_guard(*buffer_pool_);
-    char* merge_buffer = buf_guard.get();
-    
     // 合并指针数据到主文件
-    utils::cat_file_to_another(merge_buffer, buffer_len, tmp_file, f);
+    utils::cat_file_to_another(merge_buffer.get(), merge_buffer_size, tmp_file, f);
     fclose(tmp_file);
   }
 
-  // 缓冲区池会在函数结束时自动清理
+  // merge_buffer 会在作用域结束时自动清理
+
+  // 映射并返回结果
   pcoll.map(f);
   cache.reserve(pcoll.size());
   return pcoll.size();

@@ -26,9 +26,6 @@ private:
   extend &operator=(const memtool::extend &b) = delete;
   extend &operator=(memtool::extend &&b) = delete;
 
-  // 缓冲区池，替代原有的手动缓冲区管理
-  static inline std::unique_ptr<BufferPool> buffer_pool_;
-
   template <typename F, typename... Args>
   static void employ_memory_block(size_t start, size_t size,
                                   vm_area_data *vma, F &&call,
@@ -58,6 +55,10 @@ private:
   };
 
 public:
+  // 缓冲区池，用于高效管理扫描过程中的内存缓冲区
+  // 在 for_each_memory_call 中创建和销毁
+  static inline std::unique_ptr<BufferPool> buffer_pool_;
+
   static inline std::list<vm_area_data *> vm_area_list; // 全局模块列表
 
   static inline std::vector<vm_area_data *> vm_area_vec; // 指针扫描列表

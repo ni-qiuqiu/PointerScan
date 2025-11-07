@@ -125,7 +125,18 @@ size_t chainer::cscan<T>::scan_pointer_chain_to_txt(std::vector<T> &addr, int de
     utils::timer ptimer;
     ptimer.start();
     
+/*     struct pointer_range {
+        int level;
+        memtool::vm_static_data *vma;
+        //使用自实现的mmap文件队列 避免内存不足oom  bfs扫描模式 内存爆炸
+        utils::mapqueue<chainer::pointer_dir<T>> results;
+     */
     std::vector<chainer::pointer_range<T>> ranges;
+/*     struct pointer_dir {
+        T address;
+        T value;
+        uint32_t start;//索引起始
+        uint32_t end;//索引结束 */
     std::vector<utils::mapqueue<pointer_dir<T>>> dirs(depth + 1);
     size_t first_range_idx = 0;
     size_t total_count = 0;
