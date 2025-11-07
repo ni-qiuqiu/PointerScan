@@ -51,6 +51,7 @@ size_t chainer::format<T>::format_bin_chain_data(FILE *instream, FILE *outstream
 
     size_t count;
 
+    //chainer::cprog_chain_info<T>
     auto [addr, size, syms, contents] = this->parse_cprog_bin_data(instream);
 
     count = 0;

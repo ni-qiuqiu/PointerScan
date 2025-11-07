@@ -1,14 +1,15 @@
 #pragma once
 
 #include <list>
-#include <unordered_set>
 #include <vector>
+#include <memory>
 
 #include "sutils.h"
 #include "threadpool.h"
 
 #include "membase.hpp"
 #include "memsetting.h"
+#include "BufferPool.hpp"
 
 #include <sys/mman.h>
 #include <sys/user.h>
@@ -25,24 +26,22 @@ private:
   extend &operator=(const memtool::extend &b) = delete;
   extend &operator=(memtool::extend &&b) = delete;
 
-  static inline std::mutex mem_mutex;
-
-  static inline std::condition_variable mem_condition;
+  // 缓冲区池，替代原有的手动缓冲区管理
+  static inline std::unique_ptr<BufferPool> buffer_pool_;
 
   template <typename F, typename... Args>
-  static void employ_memory_block(size_t start, size_t size, char **buffer,
-                                  int &index, vm_area_data *vma, F &&call,
+  static void employ_memory_block(size_t start, size_t size,
+                                  vm_area_data *vma, F &&call,
                                   Args &&...args);
 
   template <typename F>
   static void divide_memory_to_block(size_t start, size_t end,
-                                     vm_area_data *vma, char **buffer,
-                                     int &index, int size, F &&call);
+                                     vm_area_data *vma, int size, F &&call);
 
   template <typename C, typename F>
   static void divide_memory_to_block(size_t start, size_t end,
-                                     vm_area_data *vma, char **buffer,
-                                     int &index, int size, C &cache, F &&call);
+                                     vm_area_data *vma, int size, 
+                                     C &cache, F &&call);
 
   template <typename F>
   static void for_each_memory_call(size_t start, size_t end, bool rest,
@@ -91,37 +90,24 @@ public:
 
 template <class F, class... Args>
 void memtool::extend::employ_memory_block(size_t start, size_t size,
-                                          char **buffer, int &index,
                                           memtool::vm_area_data *vma, F &&call,
                                           Args &&...args) {
-  char *buf;
-
-  std::unique_lock<std::mutex> lock(mem_mutex);
-  if (index < 0)
-    mem_condition.wait(lock, [&index] { return index >= 0; });
-
-  buf = buffer[index];//获取缓冲区
-  --index;
-  lock.unlock();
+  // 使用 BufferGuard RAII 管理缓冲区
+  BufferGuard buf_guard(*buffer_pool_);
+  char *buf = buf_guard.get();
 
   // readv(start, buf, size);
   call(buf, start, size, vma, std::forward<Args>(args)...);
 
-  lock.lock();
-  ++index;
-  buffer[index] = buf;
-  lock.unlock();
-
-  mem_condition.notify_one();
+  // BufferGuard 析构时自动释放缓冲区
 }
 
 template <class C, class F>
 void memtool::extend::divide_memory_to_block(size_t start, size_t end,
                                              memtool::vm_area_data *vma,
-                                             char **buffer, int &index,
                                              int size, C &cache/*结果缓存*/, F &&call/*回调函数*/) {
-  auto employ_memory = [buffer, &call, &index, vma](auto s, auto e, auto &dat) {
-    employ_memory_block(s, e, buffer, index, vma, call, dat);
+  auto employ_memory = [&call, vma](auto s, auto e, auto &dat) {
+    employ_memory_block(s, e, vma, call, dat);
   };
 
   auto push_pool = [&start, &employ_memory, &cache](auto t) {
@@ -138,10 +124,9 @@ void memtool::extend::divide_memory_to_block(size_t start, size_t end,
 template <class F>
 void memtool::extend::divide_memory_to_block(size_t start, size_t end,
                                              memtool::vm_area_data *vma,
-                                             char **buffer, int &index,
                                              int size, F &&call) {
-  auto employ_memory = [buffer, &call, &index, vma](auto s, auto e) {
-    employ_memory_block(s, e, buffer, index, vma, call);
+  auto employ_memory = [&call, vma](auto s, auto e) {
+    employ_memory_block(s, e, vma, call);
   };
 
   auto push_pool = [&start, &employ_memory](auto t) {
@@ -156,75 +141,76 @@ void memtool::extend::divide_memory_to_block(size_t start, size_t end,
 template <class F>
 void memtool::extend::for_each_memory_call(size_t start, size_t end, bool rest,
                                            int count, int size, F &&call) {
-  int index;
-  char *buffer[count];
+  // 初始化 BufferPool，替代手动分配缓冲区数组
+  buffer_pool_ = std::make_unique<BufferPool>(count, size);
 
-  index = count - 1;
-  for (auto i = 0; i <= index; ++i)
-    buffer[i] = new char[size];//预分配内存
+  printf("for_each_memory_call count %zu\n", vm_area_vec.size());
 
-  if (rest)
-    goto limit;
-
-  printf("for_each_memory_call count %d\n", vm_area_vec.size());
-  for (auto vma : vm_area_vec)
-    call(vma->start, vma->end, vma, buffer, index);
-
-  goto wait_for_finish;
-
-limit:
-  for (auto vma : vm_area_vec) {
-    size_t max, min;
-
-    max = std::max(vma->start, start);
-    min = std::min(vma->end, end);
-    if (max <= min)
-      call(vma->start, vma->end, vma, buffer, index);
+  if (rest) {
+    // 受限模式：只处理指定范围内的内存区域
+    for (auto vma : vm_area_vec) {
+      size_t range_start = std::max(vma->start, start);
+      size_t range_end = std::min(vma->end, end);
+      
+      if (range_start <= range_end) {
+        call(vma->start, vma->end, vma);
+      }
+    }
+  } else {
+    // 全量模式：处理所有内存区域
+    for (auto vma : vm_area_vec) {
+      call(vma->start, vma->end, vma);
+    }
   }
 
-wait_for_finish:
+  // 等待所有线程完成
   utils::thread_pool->wait();
 
-  for (auto i = 0; i < count; ++i)
-    delete[] buffer[i];
+  // BufferPool 会在 unique_ptr 析构时自动清理
+  buffer_pool_.reset();
 }
 
 template <class C, class F>
 auto memtool::extend::for_each_memory_impl<C, F>::for_each_memory_area(
     size_t start, size_t end, bool rest, int count, int size, F &&call) {
-  size_t t;
   std::vector<C> cache;
 
-  t = 0;
-  //计算需要多少size大小的块
+  // 计算需要多少 size 大小的块
+  size_t total_blocks = 0;
   for (auto &vma : vm_area_vec) {
-    if (vma->prot & PROT_READ)
-      t += DIV_ROUND_UP(vma->end - vma->start, size);
-  }
-  //预分配内存
-  cache.reserve(t);
-
-  std::atomic<int> cout = 0;
-  auto for_each = [size/*块大小*/, &call, &cache, &cout](auto start, auto end, auto vma,
-                                               auto buffer/*缓冲区*/, int &index/*缓冲区大小*/) {
     if (vma->prot & PROT_READ) {
-      cout.fetch_add(1, std::memory_order_relaxed);
-      divide_memory_to_block(start, end, vma, buffer, index, size, cache, call);
+      size_t mem_size = vma->end - vma->start;
+      total_blocks += DIV_ROUND_UP(mem_size, size);
+    }
+  }
+  
+  // 预分配内存
+  cache.reserve(total_blocks);
+
+  // 统计处理的内存区域数量
+  std::atomic<int> processed_count(0);
+  
+  auto for_each = [size, &call, &cache, &processed_count](
+      auto mem_start, auto mem_end, auto vma) {
+    if (vma->prot & PROT_READ) {
+      processed_count.fetch_add(1, std::memory_order_relaxed);
+      divide_memory_to_block(mem_start, mem_end, vma, size, cache, call);
     }
   };
 
   for_each_memory_call(start, end, rest, count, size, for_each);
-  printf("cout %d\n", cout.load(std::memory_order_relaxed));
+  
+  printf("Processed memory areas: %d\n", processed_count.load(std::memory_order_relaxed));
   return cache;
 }
 
 template <class F>
 void memtool::extend::for_each_memory_impl<void, F>::for_each_memory_area(
     size_t start, size_t end, bool rest, int count, int size, F &&call) {
-  auto for_each = [size, &call](auto start, auto end, auto vma, auto buffer,
-                                auto &index) {
-    if (vma->prot & PROT_READ)
-      divide_memory_to_block(start, end, vma, buffer, index, size, call);
+  auto for_each = [size, &call](auto mem_start, auto mem_end, auto vma) {
+    if (vma->prot & PROT_READ) {
+      divide_memory_to_block(mem_start, mem_end, vma, size, call);
+    }
   };
 
   for_each_memory_call(start, end, rest, count, size, for_each);

@@ -43,38 +43,37 @@ void chainer::search<T>::output_pointer_to_file(FILE *f, T *buffer, T start, siz
 }
 
 template <class T>
-void chainer::search<T>::filter_pointer_to_fmmap(char *buffer, T start,
-                    size_t len, memtool::vm_area_data *vma, FILE *&f)
+void chainer::search<T>::filter_pointer_to_fmmap(T start, size_t len,
+                    memtool::vm_area_data *vma, FILE *&f)
 {
-    T min, max, sub;
-
-    f = tmpfile(); // wb+;
-    if (f == nullptr)
-        return;
-
-    min = memtool::extend::vm_area_vec.front()->start,
-    max = memtool::extend::vm_area_vec.back()->end;
-    sub = max - min;
-
-    if (memtool::extend::readv(start, buffer, len) == -1)
-    {
-        fclose(f), f = nullptr;
+    f = tmpfile();
+    if (f == nullptr) {
         return;
     }
-    // std::vector<std::pair<size_t, size_t>> addr_size_pairs;
-    // addr_size_pairs.emplace_back(start, len);
-    // std::vector<void *> buffers;
-    // buffers.emplace_back(buffer);
-    // if (memtool::extend::readv_batch(addr_size_pairs, buffers) == -1)
-    // {
-    //     fclose(f), f = nullptr;
-    //     return;
-    // }
 
+    // 获取内存范围
+    auto &vm_vec = memtool::extend::vm_area_vec;
+    T min = vm_vec.front()->start;
+    T max = vm_vec.back()->end;
+    T sub = max - min;
 
-    output_pointer_to_file(f, (T *)buffer, start, len / sizeof(T), min, sub);
+    // 使用 BufferPool 获取缓冲区（通过 RAII 自动管理）
+    memtool::BufferGuard buf_guard(*buffer_pool_);
+    char* local_buffer = buf_guard.get();
+
+    // 读取内存数据
+    if (memtool::extend::readv(start, local_buffer, len) == -1) {
+        fclose(f);
+        f = nullptr;
+        return;
+    }
+
+    // 输出指针到文件
+    size_t element_count = len / sizeof(T);
+    output_pointer_to_file(f, (T *)local_buffer, start, element_count, min, sub);
 
     fflush(f);
+    // BufferGuard 析构时自动释放缓冲区
 }
 
 
@@ -84,37 +83,44 @@ void chainer::search<T>::filter_pointer_from_fmmap(P &&input,
     chainer::pointer_data<T> *start, size_t count, size_t offset, 
     std::atomic<size_t> &total, utils::list_head<pointer_pcount<T>> *block)
 {
-    int lower, upper;
-    size_t size, pcount;
-    T min, max, sub, value;
-    pointer_data<T> *data, **save;
+    // 获取内存范围
+    auto &vm_vec = memtool::extend::vm_area_vec;
+    T min = vm_vec.front()->start;
+    T max = vm_vec.back()->end;
+    T sub = max - min;
+    
+    size_t input_size = input.size();
+    pointer_data<T> **save = block->data.data;
+    size_t pcount = 0;
 
-    min = memtool::extend::vm_area_vec.front()->start;
-    max = memtool::extend::vm_area_vec.back()->end;
-    sub = max - min;
-    size = input.size();
-
-    pcount = 0;
-    save = block->data.data;
-    for (auto i = 0ul; i < count; ++i)
-    {
-        data = start + i;//获取全局指针数据
-        //data 就是全局指针数据
-        value = data->value;
-        if ((value - min) > sub)
+    // 遍历全局指针数据表，找到与上一层匹配的指针
+    // 思路：
+    // 1. 将全局指针数据表分为多个块，多线程处理提高效率
+    // 2. 对每个指针数据进行二分查找匹配上层数据（按地址排序）
+    // 复杂度：O(n) vs 常规 O(m)*O(logn)
+    for (size_t i = 0; i < count; ++i) {
+        pointer_data<T> *data = start + i;
+        T value = data->value;
+        
+        // 检查值是否在有效范围内
+        if ((value - min) > sub) {
             continue;
-                      //dir[level-1]
-        utils::binary_search(input, search_pointer_by_bin_gt, value, size, lower, upper);
-        //遍历全局指针数据表 找到与上一层匹配的指针（上一层是按地址排序的）
-        //得到的是匹配索引
-        //这里的思路是
-        // //1.将全局指针数据表分为多个块 多线程进行 提高效率
-        //2.指针数据表中的单个数据进行二分匹配上层数据（按地址排序的）
-        // [上层数据比全局指针数据表小 O(n) 而常规是上层数据每一条都去查全局指针数据表 O(m)*O(logn)]
-        //
+        }
 
-        if ((size_t)lower == size || utils::address_of(input[lower])->address - value > offset)
+        // 二分查找匹配的内存区域
+        int lower, upper;
+        utils::binary_search(input, search_pointer_by_bin_gt, value, 
+                           input_size, lower, upper);
+
+        // 验证匹配结果
+        if (static_cast<size_t>(lower) == input_size) {
             continue;
+        }
+        
+        T target_addr = utils::address_of(input[lower])->address;
+        if (target_addr < value || (target_addr - value) > offset) {
+            continue;
+        }
 
         save[pcount++] = data;
     }
@@ -128,70 +134,84 @@ template <typename P>
 void chainer::search<T>::filter_pointer_to_block(P &&input, size_t offset,
      utils::list_head<pointer_pcount<T>> *node, size_t avg, std::atomic<size_t> &total)
 {
-    pointer_data<T> *start, **save;
-
+    // 转换缓存为指针队列
     auto &trf = reinterpret_cast<utils::mapqueue<pointer_data<T> *> &>(cache);
+    
+    pointer_data<T> *start = &pcoll.front();
+    pointer_data<T> **save = &trf.front();
 
-    auto find_pointer = [this, &input, &total, offset](auto start, auto count, auto block)
-    {
-        filter_pointer_from_fmmap(input, start, count, offset, total, block);
+    // 创建查找指针的回调函数
+    auto find_pointer = [this, &input, &total, offset](
+        auto ptr_start, auto count, auto block) {
+        filter_pointer_from_fmmap(input, ptr_start, count, offset, total, block);
     };
 
-    auto push_pool = [&find_pointer, &start, &save, &node](auto pos)
-    {
+    // 创建任务分配的回调函数
+    auto push_pool = [&](auto block_size) {
+        // 创建新的链表节点
         node->next = new utils::list_head<pointer_pcount<T>>;
         node = node->next;
         node->data.data = save;
 
-        utils::thread_pool->pushpool(find_pointer, start, pos, node);
+        // 提交任务到线程池
+        utils::thread_pool->pushpool(find_pointer, start, block_size, node);
 
-        start += pos, save += pos;
+        // 更新指针位置
+        start += block_size;
+        save += block_size;
     };
 
-    start = &pcoll.front();
-    save = &trf.front();
+    // 将数据分块并提交到线程池
     utils::split_num_to_avg(pcoll.size(), avg, push_pool);
 }
 
 template <class T> // 0, 0, false, 10, 1 << 20
 size_t chainer::search<T>::get_pointers(T start, T end, bool rest, int count,
                                         int size) {
-  FILE *f;
-  uint32_t len;
-  char *buffer; // 文件io缓冲区
-
-  len = 1 << 20; // 1m
-  buffer = new char[len];
-
+  // 清理缓存
   cache.shrink();
   pcoll.shrink();
-  f = tmpfile();
-  if (f == nullptr)
+  
+  // 创建临时文件
+  FILE *f = tmpfile();
+  if (f == nullptr) {
     return 0;
+  }
 
-  auto fptofile = [this](auto buffer, auto start, auto len, auto vma,
-                         auto &dat) {
-    filter_pointer_to_fmmap(buffer, start, len, vma, dat);
+  // 初始化缓冲区池
+  // 使用线程数 + 2 个缓冲区，确保有足够的缓冲区供多线程使用
+  // 每个缓冲区 1MB，足够扫描使用
+  const uint32_t buffer_len = 1 << 20; // 1MB
+  size_t pool_size = utils::thread_pool ? utils::thread_pool->size() + 2 : 4;
+  buffer_pool_ = std::make_unique<memtool::BufferPool>(pool_size, buffer_len);
+
+  // 第一阶段：扫描内存，提取指针到临时文件
+  auto fptofile = [this](auto buf, auto mem_start, auto mem_len, auto vma, auto &file) {
+    // buf 参数保持接口兼容性，实际使用 BufferPool 内部获取
+    filter_pointer_to_fmmap(mem_start, mem_len, vma, file);
   };
   
-  auto ins = memtool::extend::for_each_memory_area<FILE *>(
+  auto file_list = memtool::extend::for_each_memory_area<FILE *>(
       start, end, rest, count, size, fptofile);
 
-  auto cat_file_list = [this, &f, &len, &buffer](auto &in) {
-    if (in == nullptr)
-      return;
+  // 第二阶段：合并所有临时文件
+  for (auto &tmp_file : file_list) {
+    if (tmp_file == nullptr) {
+      continue;
+    }
 
-    rewind(in);
-    // 合并所有指针数据到f文件中
-    utils::cat_file_to_another(buffer, len, in, f);
-    fclose(in);
-  }; // faster than sort i thought
+    rewind(tmp_file);
+    
+    // 使用 BufferPool 获取缓冲区来合并文件
+    memtool::BufferGuard buf_guard(*buffer_pool_);
+    char* merge_buffer = buf_guard.get();
+    
+    // 合并指针数据到主文件
+    utils::cat_file_to_another(merge_buffer, buffer_len, tmp_file, f);
+    fclose(tmp_file);
+  }
 
-  for (auto &in : ins)
-    cat_file_list(in);
-
-  delete[] buffer;
-
+  // 缓冲区池会在函数结束时自动清理
   pcoll.map(f);
   cache.reserve(pcoll.size());
   return pcoll.size();
@@ -199,41 +219,49 @@ size_t chainer::search<T>::get_pointers(T start, T end, bool rest, int count,
 
 template <class T>
 template <typename P, typename U>
-void chainer::search<T>::search_pointer(P &&input, U &out, size_t offset, bool rest, size_t limit)
+void chainer::search<T>::search_pointer(P &&input, U &out, size_t offset, 
+                                       bool rest, size_t limit)
 {
-    if (input.empty() || pcoll.begin() == nullptr || pcoll.size() == 0)
+    // 检查输入有效性
+    if (input.empty() || pcoll.begin() == nullptr || pcoll.size() == 0) {
         return;
+    }
 
-    size_t count;
+    // 初始化
     std::atomic<size_t> total(0);
-    utils::list_head<pointer_pcount<T>> *head;
+    utils::list_head<pointer_pcount<T>> *head = new utils::list_head<pointer_pcount<T>>;
+    
+    // 第一阶段：分块过滤指针（多线程）
+    // 10000 是每个线程处理的平均指针数量，可以根据需要调整
+    const size_t avg_block_size = 10000;
+    filter_pointer_to_block(input, offset, head, avg_block_size, total);
 
-    auto emplace_pointer = [this, &count, &out, &limit](auto n)
-    {
-        if (n->data.count == 0 || count >= limit)
-            return;
-
-        size_t cnt;
-        pointer_data<T> **data;
-
-        cnt = n->data.count;
-        data = n->data.data;
-        for (auto i = 0u; i < cnt; ++i)
-            out.emplace_back(data[i]);
-
-        count += cnt;
-    };
-
-    count = 0;
-    head = new utils::list_head<pointer_pcount<T>>;
-    //          dirs[level - 1]       offset
-    filter_pointer_to_block(input, offset, head, 10000, total); // 10000 is the avg to split ptr for multi threads, actually it can custom made by uself
-
+    // 等待所有线程完成
     utils::thread_pool->wait();
 
-    limit = rest ? limit : total.load();
-    limit = std::min(limit, total.load());
-    out.reserve(limit);
+    // 计算最终输出限制
+    size_t final_limit = rest ? limit : total.load();
+    final_limit = std::min(final_limit, total.load());
+    out.reserve(final_limit);
+
+    // 第二阶段：收集结果
+    size_t count = 0;
+    auto emplace_pointer = [&](auto node) {
+        // 检查是否达到限制
+        if (node->data.count == 0 || count >= final_limit) {
+            return;
+        }
+
+        // 复制指针数据到输出
+        size_t node_count = node->data.count;
+        pointer_data<T> **data = node->data.data;
+        
+        for (size_t i = 0; i < node_count; ++i) {
+            out.emplace_back(data[i]);
+        }
+
+        count += node_count;
+    };
 
     utils::free_list_for_each(head, emplace_pointer);
 }

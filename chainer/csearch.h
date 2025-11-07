@@ -1,11 +1,14 @@
 #pragma once
 
+#include <memory>
+
 #include "mapqueue.h"
 #include "sutils.h"
 
 #include "memextend.hpp"
 
 #include "cbase.h"
+#include "BufferPool.hpp"
 
 namespace chainer {
 
@@ -14,12 +17,15 @@ protected:
   utils::mapqueue<pointer_data<T>> pcoll; // pointer_coll
 
   utils::mapqueue<void *> cache; // 缓存
+  
+  // 缓冲区池，用于高效管理扫描过程中的内存缓冲区
+  std::unique_ptr<memtool::BufferPool> buffer_pool_;
 
 private:
   void output_pointer_to_file(FILE *f, T *buffer, T start, size_t maxn, T min,
                               T sub);
 
-  void filter_pointer_to_fmmap(char *buffer, T start, size_t len,
+  void filter_pointer_to_fmmap(T start, size_t len,
                                memtool::vm_area_data *vma, FILE *&f);
 
   template <typename P>

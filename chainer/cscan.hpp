@@ -16,16 +16,21 @@ void chainer::scan<T>::trans_addr_to_pointer_data(std::vector<T> &input, std::ve
 template <class T>
 void chainer::scan<T>::trans_to_pointer_pdata(std::vector<chainer::pointer_data<T> *> &input, std::vector<chainer::pointer_data<T> *> &nr, utils::mapqueue<chainer::pointer_dir<T>> &out)
 {
-    size_t size, index;
-
-    index = 0;
-    size = nr.size();
-    out.reserve(input.size() - nr.size());
+    size_t nr_size = nr.size();
+    size_t nr_index = 0;
+    
+    // 预留空间：input 减去 nr 中匹配的数量
+    out.reserve(input.size() - nr_size);
+    
+    // 遍历 input，跳过在 nr 中存在的地址
     for (auto dat : input) {
-        if (index < size && dat->address == nr[index]->address)
-            index++;
-        else
+        if (nr_index < nr_size && dat->address == nr[nr_index]->address) {
+            // 当前地址在 nr 中，跳过
+            nr_index++;
+        } else {
+            // 当前地址不在 nr 中，加入输出
             out.emplace_back(dat->address, dat->value, 0, 1);
+        }
     }
 }
 
@@ -54,17 +59,20 @@ template <class T>
 template <class P, class C>
 void chainer::scan<T>::create_assoc_dir_index(P &prev, C &curr, size_t offset, size_t avg)
 {
-    pointer_dir<T> *start;
+    pointer_dir<T> *start = &curr.front();
 
-    auto assoc_index = [this, &prev, offset](auto start, auto count) {
-         associate_data_index(prev, offset, start, count); };
-    auto push_pool = [&assoc_index, &start](auto t) {
-        utils::thread_pool->pushpool(assoc_index, start, t);
-
-        start += t;
+    // Lambda: 为指针目录创建关联索引
+    auto assoc_index = [this, &prev, offset](auto ptr_start, auto count) {
+        associate_data_index(prev, offset, ptr_start, count);
+    };
+    
+    // Lambda: 分块提交任务到线程池
+    auto push_pool = [&](size_t block_size) {
+        utils::thread_pool->pushpool(assoc_index, start, block_size);
+        start += block_size;
     };
 
-    start = &curr.front();
+    // 将数据分块并提交到线程池处理
     utils::split_num_to_avg(curr.size(), avg, push_pool);
 }
 
@@ -126,90 +134,110 @@ void chainer::scan<T>::filter_pointer_ranges(
 template <class T>
 void chainer::scan<T>::merge_pointer_dirs(utils::mapqueue<chainer::pointer_dir<T> *> &stn, chainer::pointer_dir<T> *dir, FILE *f)
 {
-    size_t size, dist;
-    uint32_t left, right;
     pointer_dir<T> *dat;
 
-    auto merge = [dir, f, &dat](auto x, auto y) {
-        for (auto i = x; i < y; ++i) {
+    // Lambda: 合并指定范围的指针目录
+    auto merge_range = [dir, f, &dat](uint32_t begin, uint32_t end) {
+        for (uint32_t i = begin; i < end; ++i) {
             dat = &dir[i];
             fwrite(&dat, sizeof(dat), 1, f);
         }
     };
 
-    dist = 0;
-    left = right = 0u;
-    size = stn.size();
-    for (auto i = 0ul; i < size; ++i) {
-        auto &start = stn[i]->start, &end = stn[i]->end;
+    size_t dist = 0;
+    uint32_t left = 0;
+    uint32_t right = 0;
+    size_t size = stn.size();
+    
+    for (size_t i = 0; i < size; ++i) {
+        uint32_t &start = stn[i]->start;
+        uint32_t &end = stn[i]->end;
 
         if (right <= start) {
+            // 当前范围与之前的不重叠
             dist += start - right;
-            left = start, right = end;
+            left = start;
+            right = end;
 
-            merge(left, right);
+            merge_range(left, right);
         } else if (right < end) {
-            merge(right, end);
-
+            // 当前范围与之前的部分重叠
+            merge_range(right, end);
             right = end;
         }
 
-        start -= dist, end -= dist;
+        // 更新索引范围
+        start -= dist;
+        end -= dist;
     }
 }
 
 template <class T>
 void chainer::scan<T>::filter_suit_dir(utils::mapqueue<chainer::pointer_dir<T> *> &stn, std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<utils::mapqueue<pointer_dir<T>>> &dirs, std::vector<std::vector<chainer::pointer_range<T> *>> &rmaps, int level)
 {
-    FILE *f;
-    size_t size;
-
-    auto comp = [](auto &&x, auto &&y) { return x->start < y->start; };
-
-    f = tmpfile();
-    if (f == nullptr)
+    // 创建临时文件
+    FILE *f = tmpfile();
+    if (f == nullptr) {
         return;
+    }
 
+    // Lambda: 按起始位置排序指针目录
+    auto compare_by_start = [](auto &&x, auto &&y) { 
+        return x->start < y->start; 
+    };
+
+    // 清空并重新填充 stn
     stn.clear();
-    for (auto &r : rmaps[level]) {
-        for (auto &v : r->results) {
-            stn.emplace_back(&v);
+    
+    // 收集当前层级的所有指针范围结果
+    for (auto &range_ptr : rmaps[level]) {
+        for (auto &result : range_ptr->results) {
+            stn.emplace_back(&result);
         }
     }
 
-    auto &content = contents[level];
-    size = content.size();
-    for (auto i = 0ul; i < size; ++i)
-        stn.emplace_back(content[i]);
+    // 添加当前层级的内容
+    auto &current_content = contents[level];
+    for (size_t i = 0; i < current_content.size(); ++i) {
+        stn.emplace_back(current_content[i]);
+    }
 
-    std::sort(stn.begin(), stn.end(), comp);
+    // 按起始位置排序
+    std::sort(stn.begin(), stn.end(), compare_by_start);
 
+    // 合并指针目录并写入文件
     merge_pointer_dirs(stn, &dirs[level - 1].front(), f);
     fflush(f);
+    
+    // 映射文件到上一层级的内容
     contents[level - 1].map(f);
 }
 
 template <class T>
 void chainer::scan<T>::stat_pointer_dir_count(std::vector<utils::mapqueue<size_t>> &counts, std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents)
 {
-    size_t size, count;
-
-    count = 0;
+    // 初始化第0层：基础计数
     counts[0].emplace_back(0);
     counts[0].emplace_back(1);
 
-    for (auto i = 1ul; i < counts.size(); ++i) {
-        count = 0;
-        auto &ccount = counts[i];
-        auto &pcount = counts[i - 1];
-        auto &content = contents[i - 1];
-        size = content.size();
-        ccount.reserve(size + 1);
-        ccount.emplace_back(count);
+    // 遍历每一层，统计累计的指针链数量
+    for (size_t i = 1; i < counts.size(); ++i) {
+        auto &current_count = counts[i];
+        auto &prev_count = counts[i - 1];
+        auto &prev_content = contents[i - 1];
+        
+        size_t content_size = prev_content.size();
+        current_count.reserve(content_size + 1);
+        
+        // 初始累计值
+        size_t cumulative_count = 0;
+        current_count.emplace_back(cumulative_count);
 
-        for (auto j = 0ul; j < size; ++j) {
-            count += pcount[content[j]->end] - pcount[content[j]->start];
-            ccount.emplace_back(count);
+        // 累加每个节点的指针链数量
+        for (size_t j = 0; j < content_size; ++j) {
+            auto *dir = prev_content[j];
+            cumulative_count += prev_count[dir->end] - prev_count[dir->start];
+            current_count.emplace_back(cumulative_count);
         }
     }
 }
@@ -217,22 +245,22 @@ void chainer::scan<T>::stat_pointer_dir_count(std::vector<utils::mapqueue<size_t
 template <class T>
 void chainer::scan<T>::integr_data_to_file(std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<chainer::pointer_range<T>> &ranges, FILE *f)
 {
-    size_t size;
-    cprog_llen llen;
-    cprog_sym<T> sym;
     cprog_header header;
-    cprog_data<T> data;
+    cprog_sym<T> sym;
+    cprog_llen llen;
 
+    // 第一部分：写入文件头
     header.size = sizeof(T);
-    header.version = 101; // ?
+    header.version = 101;
     header.module_count = ranges.size();
     header.level = contents.size() - 1;
     header.sign[0] = 0;
     strcpy(header.sign, ".bin from chainer, by 青衫白衣\n");
-    // strcat(header.sign, header_h_saying);
     fwrite(&header, sizeof(header), 1, f);
 
+    // 第二部分：写入每个范围的符号信息和结果
     for (auto &r : ranges) {
+        // 填充符号信息
         sym.start = r.vma->start;
         sym.range = r.vma->range;
         sym.count = r.vma->count;
@@ -241,105 +269,131 @@ void chainer::scan<T>::integr_data_to_file(std::vector<utils::mapqueue<chainer::
         strcpy(sym.name, r.vma->name);
         fwrite(&sym, sizeof(sym), 1, f);
 
+        // 写入指针结果数据
         fwrite(r.results.begin(), sizeof(*r.results.begin()), r.results.size(), f);
     }
 
-    for (auto i = 0ul; i < contents.size() - 1; i++) {
+    // 第三部分：写入每一层的内容数据
+    for (size_t i = 0; i < contents.size() - 1; i++) {
         auto &content = contents[i];
-        size = content.size();
+        size_t content_size = content.size();
 
+        // 写入层级信息
         llen.level = i;
-        llen.count = size;
+        llen.count = content_size;
         fwrite(&llen, sizeof(llen), 1, f);
 
-        for (auto j = 0ul; j < size; ++j) {
+        // 写入该层的所有指针目录
+        for (size_t j = 0; j < content_size; ++j) {
             fwrite(content[j], sizeof(*content[j]), 1, f);
         }
     }
+    
     fflush(f);
 }
 
 template <class T>
 void chainer::scan<T>::integr_data_to_txt(std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> &contents, std::vector<chainer::pointer_range<T>> &ranges, FILE *f)
 {
-    if (f == nullptr || ranges.empty())
+    if (f == nullptr || ranges.empty()) {
         return;
+    }
 
-    char buf[1024];
-    std::atomic_size_t total_count(0);
+    char buffer[1024];
+    std::atomic_size_t total_chains(0);
 
-    // 递归输出指针链的辅助函数
-    auto out_chain_recursive = [&contents](FILE *out_f, char *buffer, int level, chainer::pointer_dir<T> *dat) {
-        auto impl = [&contents](FILE *out_f, char *buffer, int level, chainer::pointer_dir<T> *dat, auto &impl_ref) -> size_t {
+    // Lambda: 递归输出指针链
+    // 这个 lambda 使用立即调用的 lambda 表达式 (IIFE) 来实现递归
+    auto output_chain_recursive = [&contents](FILE *out_file, char *buf, int level, chainer::pointer_dir<T> *dir) {
+        // 递归实现函数
+        auto recursive_impl = [&contents](FILE *out_file, char *buf, int level, 
+                                         chainer::pointer_dir<T> *dir, auto &self_ref) -> size_t {
             if (level == 0) {
-                // 到达最底层，输出完整链
-                strcat(buffer, "\n");
-                fwrite(buffer, strlen(buffer), 1, out_f);
+                // 基础情况：到达最底层，输出完整链
+                strcat(buf, "\n");
+                fwrite(buf, strlen(buf), 1, out_file);
                 return 1;
-            } else {
-                size_t count = 0;
-                char *current_pos = buffer + strlen(buffer);
-                
-                // 遍历当前节点索引的所有子节点
-                for (auto i = dat->start; i < dat->end; ++i) {
-                    *current_pos = 0;  // 重置当前位置
-                    auto *child = contents[level - 1][i];
-                    
-                    // 添加偏移信息
-                    auto n = sprintf(current_pos, " -> + 0x%lX", (size_t)(child->address - dat->value));
-                    count += impl_ref(out_f, buffer, level - 1, child, impl_ref);
-                }
-                return count;
             }
+            
+            // 递归情况：遍历子节点
+            size_t chain_count = 0;
+            char *write_position = buf + strlen(buf);
+            
+            for (uint32_t i = dir->start; i < dir->end; ++i) {
+                *write_position = '\0';  // 重置写入位置
+                auto *child_dir = contents[level - 1][i];
+                
+                // 添加偏移信息到缓冲区
+                sprintf(write_position, " -> + 0x%lX", 
+                       static_cast<size_t>(child_dir->address - dir->value));
+                
+                // 递归处理子节点
+                chain_count += self_ref(out_file, buf, level - 1, child_dir, self_ref);
+            }
+            
+            return chain_count;
         };
-        return impl(out_f, buffer, level, dat, impl);
+        
+        // 启动递归
+        return recursive_impl(out_file, buf, level, dir, recursive_impl);
     };
 
     // 遍历每个模块范围
-    for (auto &r : ranges) {
+    for (auto &range : ranges) {
         printf("Writing chains for %s[%d] at level %d, count: %ld\n", 
-               r.vma->name, r.vma->count, r.level, r.results.size());
+               range.vma->name, range.vma->count, range.level, range.results.size());
         
         // 遍历该模块中的每个指针数据
-        for (auto &dat : r.results) {
-            *buf = 0;
+        for (auto &pointer_dir : range.results) {
+            // 重置缓冲区
+            buffer[0] = '\0';
             
             // 输出起始部分: 模块名[编号] + 0x偏移
-            auto n = sprintf(buf, "%s[%d] + 0x%lX", 
-                           r.vma->name, 
-                           r.vma->count, 
-                           (size_t)(dat.address - r.vma->start));
+            sprintf(buffer, "%s[%d] + 0x%lX", 
+                   range.vma->name, 
+                   range.vma->count, 
+                   static_cast<size_t>(pointer_dir.address - range.vma->start));
             
             // 递归输出完整的指针链
-            auto count = out_chain_recursive(f, buf, r.level, &dat);
-            total_count += count;
+            size_t chains = output_chain_recursive(f, buffer, range.level, &pointer_dir);
+            total_chains += chains;
         }
     }
 
     fflush(f);
-    printf("Total chains written to txt: %ld\n", total_count.load());
+    printf("Total chains written to txt: %ld\n", total_chains.load());
 }
 
 template <class T>
 chainer::chain_info<T> chainer::scan<T>::build_pointer_dirs_tree(std::vector<utils::mapqueue<chainer::pointer_dir<T>>> &dirs, std::vector<chainer::pointer_range<T>> &ranges)
 {
-    std::vector<std::vector<chainer::pointer_range<T> *>> rmaps(dirs.size());
-    std::vector<utils::mapqueue<size_t>> counts(ranges.back().level + 1);
-    std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> contents(ranges.back().level + 1);
+    // 初始化数据结构
+    int max_level = ranges.back().level;
+    std::vector<std::vector<chainer::pointer_range<T> *>> range_maps(dirs.size());
+    std::vector<utils::mapqueue<size_t>> counts(max_level + 1);
+    std::vector<utils::mapqueue<chainer::pointer_dir<T> *>> contents(max_level + 1);
 
-    auto &stn = reinterpret_cast<utils::mapqueue<chainer::pointer_dir<T> *> &>(this->cache);
+    // 复用缓存作为临时存储
+    auto &temp_storage = reinterpret_cast<utils::mapqueue<chainer::pointer_dir<T> *> &>(this->cache);
 
-    for (auto &r : ranges)
-        rmaps[r.level].emplace_back(&r);
-
-    for (auto i = ranges.back().level; i > 0; i--) {
-        filter_suit_dir(stn, contents, dirs, rmaps, i);
-        if (contents[i - 1].begin() == nullptr || contents[i - 1].size() == 0)
-            return {};
-
-        // printf("%d %d %d %p\n", i, stn.size(), contents[i - 1].size(), contents[i - 1].begin());
+    // 构建范围映射：按层级分组
+    for (auto &range : ranges) {
+        range_maps[range.level].emplace_back(&range);
     }
 
+    // 从最高层向下过滤和构建指针目录树
+    for (int level = max_level; level > 0; --level) {
+        filter_suit_dir(temp_storage, contents, dirs, range_maps, level);
+        
+        // 验证该层内容是否有效
+        if (contents[level - 1].empty() || contents[level - 1].begin() == nullptr) {
+            return {};  // 返回空结果
+        }
+    }
+
+    // 统计每层的指针目录数量
     stat_pointer_dir_count(counts, contents);
+    
+    // 返回构建结果（使用移动语义）
     return {std::move(counts), std::move(contents)};
 }
