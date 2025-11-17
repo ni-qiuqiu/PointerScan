@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cbase.h"
+#include <stdexcept>
 
 #define PARSE_ADDR_DATA(a, b) \
     a = (decltype(a))b;       \
@@ -51,7 +52,11 @@ chainer::cprog_chain_info<T> chainer::base<T>::parse_cprog_bin_data(FILE *f)
     fd = fileno(f);
     fstat(fd, &st);
     data.size = st.st_size;
-    data.addr = (char *)mmap(nullptr, data.size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    printf("data.size %ld fd %d\n", data.size, fd);
+  data.addr = (char *)mmap(nullptr, data.size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+  if (data.addr == MAP_FAILED) {
+    throw std::runtime_error("指针链文件映射失败");
+  }
     parse_cprog_bin_data(data);
     return data;
 }

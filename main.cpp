@@ -2,31 +2,57 @@
 
 #include "memtool/memextend.hpp"
 
-#include "chainer/ccformat.hpp"
-#include "chainer/ccscan.hpp"
-
+#include "chainer/ccscan.hpp"  // IWYU pragma: keep
+#include "chainer/ccompare.hpp"  // IWYU pragma: keep
 
 #include "utils/cmd_parser.h"
 #include <cstdint>
+#include <cstdio>
+#include <sstream>
 
 using namespace utils;
+
+namespace {
+
+std::string format_chain_line(const std::string &module_name, int module_index,
+                              const std::vector<size_t> &offsets) {
+  std::ostringstream oss;
+  oss << module_name << "[" << module_index << "]";
+  if (!offsets.empty()) {
+    oss << std::hex << std::uppercase;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      oss << (i == 0 ? " + 0x" : " -> + 0x") << offsets[i];
+    }
+    oss << std::nouppercase << std::dec;
+  }
+  return oss.str();
+}
+
+}  // namespace
 
 int main(int argc, char *argv[]) {
   // 创建命令行解析器
   CommandLineParser parser("newscan", "高性能内存指针链分析工具");
 
   // 添加命令行选项
-  parser.addOption({'p', "process", "目标进程名称或PID", true, true});
+  parser.addOption({'p', "process", "目标进程名称或PID", true, false});
   parser.addOption({'a', "address", "目标地址(16进制，不带0x前缀)", true, false});
   parser.addOption({'d', "depth", "最大搜索深度", true, false, "10"});
   parser.addOption({'o', "offset", "最大偏移量", true, false, "500"});
   parser.addOption({'l', "limit", "结果限制数量", true, false, "0"});
   parser.addOption({'f', "file", "输出文件名", true, false, "pointer_chains.txt"});
+  parser.addOption({0, "compare-bin", "比较两份指针链二进制文件", false, false});
+  parser.addOption({0, "compare-txt", "比较两份指针链文本文件", false, false});
+  parser.addOption({0, "lhs", "旧版指针链二进制文件路径", true, false});
+  parser.addOption({0, "rhs", "新版指针链二进制文件路径", true, false});
+  parser.addOption({0, "report", "对比输出文件名", true, false,
+                    "chain_compare.txt"});
   parser.addOption({'v', "verbose", "详细输出模式", false, false});
   parser.addOption({'h', "help", "显示帮助信息", false, false});
 
   // 设置用法说明
-  parser.setUsage("[选项] -p <进程名/PID> [-a <地址>]");
+  parser.setUsage("[扫描] -p <进程名/PID> -a <地址> | "
+                  "[对比] (--compare-bin|--compare-txt) --lhs <旧文件> --rhs <新文件>");
 
   // 解析命令行参数
   if (!parser.parse(argc, argv)) {
@@ -39,6 +65,90 @@ int main(int argc, char *argv[]) {
   if (parser.hasOption("help")) {
     parser.showHelp();
     return 0;
+  }
+
+  bool compare_bin_mode = parser.getBoolOption("compare-bin", false);
+  bool compare_txt_mode = parser.getBoolOption("compare-txt", false);
+  if (compare_bin_mode || compare_txt_mode) {
+    if (!parser.hasOption("lhs") || !parser.hasOption("rhs")) {
+      std::cerr << "错误: 对比模式需要提供 --lhs 与 --rhs 选项" << std::endl;
+      return 1;
+    }
+
+    auto lhs_path = parser.getOptionValue("lhs");
+    auto rhs_path = parser.getOptionValue("rhs");
+
+    chainer::ccompare<size_t> comparer;
+    chainer::bin_compare_result<size_t> compare_result;
+
+    try {
+      if (compare_bin_mode) {
+        compare_result = comparer.compare_bin_files(lhs_path, rhs_path);
+      } else {
+        compare_result = comparer.compare_txt_files(lhs_path, rhs_path);
+      }
+    } catch (const std::exception &ex) {
+      std::cerr << "错误: " << ex.what() << std::endl;
+      return 1;
+    }
+
+    std::string report_path =
+        parser.getOptionValue("report", "chain_compare.txt");
+    FILE *report = fopen(report_path.c_str(), "w");
+    if (report == nullptr) {
+      std::cerr << "警告: 无法创建报告文件: " << report_path << std::endl;
+    }
+
+    auto emit_line = [&](const std::string &line) {
+      //printf("%s\n", line.c_str());
+      if (report != nullptr) {
+        fprintf(report, "%s\n", line.c_str());
+      }
+    };
+
+    if (compare_bin_mode) {
+      emit_line("=== 指针链二进制文件对比结果 ===");
+    } else {
+      emit_line("=== 指针链文本文件对比结果 ===");
+    }
+    emit_line("旧文件链数量: " + std::to_string(compare_result.lhs_total));
+    emit_line("新文件链数量: " + std::to_string(compare_result.rhs_total));
+    emit_line("保持不变链数量: " + std::to_string(compare_result.unchanged));
+    emit_line("");
+
+    if (compare_result.modules.empty()) {
+      emit_line("未找到共同存在的指针链。");
+    } else {
+      for (const auto &diff : compare_result.modules) {
+        emit_line("模块: " + diff.module_name + "[" +
+                  std::to_string(diff.module_index) + "]");
+        if (!diff.common.empty()) {
+          emit_line("  保持不变的链:");
+          for (const auto &chain : diff.common) {
+            emit_line("    = " +
+                      format_chain_line(diff.module_name, diff.module_index,
+                                        chain));
+          }
+        }
+        emit_line("");
+      }
+    }
+
+    if (report != nullptr) {
+      fclose(report);
+      printf("对比报告已保存至: %s\n", report_path.c_str());
+    }
+
+    return 0;
+  }
+
+  if (!parser.hasOption("process")) {
+    std::cerr << "错误: 扫描模式需要提供目标进程 (-p/--process)" << std::endl;
+    return 1;
+  }
+  if (!parser.hasOption("address")) {
+    std::cerr << "错误: 扫描模式需要提供目标地址 (-a/--address)" << std::endl;
+    return 1;
   }
 
   // 第一步：获取目标进程
