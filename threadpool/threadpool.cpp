@@ -34,19 +34,21 @@ void threadpool::work_thread()
 
         // 执行任务（在锁外执行以减少锁持有时间）
         if (task) {
-            active_tasks.fetch_add(1, std::memory_order_relaxed);
+            active_tasks.fetch_add(1, std::memory_order_acq_rel);
             
             try {
                 task();
             } catch (...) {
                 // 捕获并忽略任务执行中的异常
-                // 实际应用中可以添加日志记录
             }
             
-            active_tasks.fetch_sub(1, std::memory_order_relaxed);
+            // 【修复】使用更强的内存序，确保其他线程能看到更新
+            size_t prev = active_tasks.fetch_sub(1, std::memory_order_acq_rel);
             
-            // 通知可能在等待的 wait() 函数
-            wait_condition.notify_all();
+            // 【优化】只有当可能是最后一个任务时才通知
+            if (prev == 1) {
+                wait_condition.notify_all();
+            }
         }
     }
 }
@@ -110,14 +112,30 @@ void threadpool::change_thread(size_t count)
 }
 
 // 等待所有任务完成
+// 【修复】使用超时等待 + 双重检查，避免死锁
 void threadpool::wait()
 {
-    std::unique_lock<std::mutex> lock(queue_mutex);
-    
-    // 等待任务队列为空且没有活跃任务
-    wait_condition.wait(lock, [this] {
-        return tasks.empty() && active_tasks.load(std::memory_order_relaxed) == 0;
-    });
+    while (true) {
+        // 快速无锁检查
+        if (active_tasks.load(std::memory_order_acquire) == 0) {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            // 双重检查：队列为空且无活跃任务
+            if (tasks.empty() && active_tasks.load(std::memory_order_acquire) == 0) {
+                return;
+            }
+        }
+        
+        // 带超时的等待，防止永久阻塞
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            bool done = wait_condition.wait_for(lock, std::chrono::milliseconds(10), [this] {
+                return tasks.empty() && active_tasks.load(std::memory_order_acquire) == 0;
+            });
+            if (done) {
+                return;
+            }
+        }
+    }
 }
 
 // 获取待处理任务数量

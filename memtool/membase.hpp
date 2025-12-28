@@ -103,16 +103,14 @@ inline long memtool::base::readv(S addr, T *data)
 template <class S>
 inline long memtool::base::readv(S addr, void *data, size_t size)
 {
-
-  
     mem_local->iov_base = data;
     mem_local->iov_len = size;
     mem_remote->iov_base = reinterpret_cast<void *>(addr);
     mem_remote->iov_len = size;
-    if(size>1024*1024)
-    printf("readv size=  %d MB\n",size/1024/1024);
+    if(size > 1024*1024)
+        printf("readv size= %zu MB\n", size/1024/1024);  // 【修复】使用 %zu
 
-   long result= syscall(SYS_process_vm_readv, target_pid, mem_local, 1, mem_remote, 1, 0);
+    long result = syscall(SYS_process_vm_readv, target_pid, mem_local, 1, mem_remote, 1, 0);
    
     return result;
 }

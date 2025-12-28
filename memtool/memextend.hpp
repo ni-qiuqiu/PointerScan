@@ -93,14 +93,22 @@ template <class F, class... Args>
 void memtool::extend::employ_memory_block(size_t start, size_t size,
                                           memtool::vm_area_data *vma, F &&call,
                                           Args &&...args) {
-  // 使用 BufferGuard RAII 管理缓冲区
-  BufferGuard buf_guard(*buffer_pool_);
-  char *buf = buf_guard.get();
+  // 【修复】使用带超时的缓冲区获取，防止死锁
+  char *buf = buffer_pool_->acquire(10000);  // 10秒超时
+  if (buf == nullptr) {
+    // 超时处理：记录警告并跳过此内存块
+    printf("警告: 获取缓冲区超时，跳过内存块 0x%lx\n", start);
+    return;
+  }
 
-  // readv(start, buf, size);
-  call(buf, start, size, vma, std::forward<Args>(args)...);
-
-  // BufferGuard 析构时自动释放缓冲区
+  try {
+    call(buf, start, size, vma, std::forward<Args>(args)...);
+  } catch (...) {
+    buffer_pool_->release(buf);
+    throw;
+  }
+  
+  buffer_pool_->release(buf);
 }
 
 template <class C, class F>
@@ -142,10 +150,15 @@ void memtool::extend::divide_memory_to_block(size_t start, size_t end,
 template <class F>
 void memtool::extend::for_each_memory_call(size_t start, size_t end, bool rest,
                                            int count, int size, F &&call) {
-  // 初始化 BufferPool，替代手动分配缓冲区数组
-  buffer_pool_ = std::make_unique<BufferPool>(count, size);
+  // 【修复】确保缓冲区数量足够，避免死锁
+  // 缓冲区数量应该 >= 线程池线程数
+  size_t thread_count = utils::thread_pool->size();
+  size_t buffer_count = std::max(static_cast<size_t>(count), thread_count + 2);
+  
+  buffer_pool_ = std::make_unique<BufferPool>(buffer_count, size);
 
-  printf("for_each_memory_call count %zu\n", vm_area_vec.size());
+  printf("for_each_memory_call count %zu, buffers %zu, threads %zu\n", 
+         vm_area_vec.size(), buffer_count, thread_count);
 
   if (rest) {
     // 受限模式：只处理指定范围内的内存区域

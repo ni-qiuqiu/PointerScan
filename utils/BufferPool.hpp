@@ -62,17 +62,20 @@ public:
     BufferPool& operator=(BufferPool&&) = delete;
 
     /**
-     * @brief 获取一个缓冲区（阻塞直到可用）
-     * @return 缓冲区指针
-     * 
-     * 关键：使用条件变量阻塞，线程会真正休眠，不占用CPU
-     * 当缓冲区被释放时，条件变量会唤醒一个等待线程
+     * @brief 获取一个缓冲区（阻塞直到可用，带超时防止死锁）
+     * @param timeout_ms 超时时间（毫秒），默认5000ms
+     * @return 缓冲区指针，超时返回nullptr
      */
-    char* acquire() {
+    char* acquire(int timeout_ms = 5000) {
         std::unique_lock<std::mutex> lock(mutex_);
         
-        // 等待直到有可用缓冲区
-        cv_.wait(lock, [this] { return !available_.empty(); });
+        // 【修复】带超时的等待，防止永久阻塞导致死锁
+        bool success = cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                    [this] { return !available_.empty(); });
+        
+        if (!success || available_.empty()) {
+            return nullptr;  // 超时
+        }
         
         // 获取缓冲区
         char* buf = available_.front();
