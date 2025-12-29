@@ -61,12 +61,42 @@ struct bin_compare_result {
 template <class T>
 class ccompare : public base<T> {
  public:
+  // 二进制文件对比（方案三：树上直接查找，高效低内存）
   bin_compare_result<T> compare_bin_files(const std::string &lhs_path,
                                           const std::string &rhs_path);
+  // 文本文件对比（保持原有实现）
   bin_compare_result<T> compare_txt_files(const std::string &lhs_path,
                                           const std::string &rhs_path);
 
  private:
+  // ============ 方案三：树上直接查找相关方法 ============
+  
+  // 验证二进制文件格式
+  void validate_bin_file(FILE *file, const std::string &path);
+  
+  // 统计单个文件的链总数（不展开，直接在树上计算）
+  size_t count_chains_in_tree(const cprog_chain_info<T> &info);
+  size_t count_chains_recursive(const cprog_chain_info<T> &info,
+                                const cprog_data<T> &dir, int level);
+  
+  // 在树上匹配模块的根节点
+  size_t match_module_roots(const cprog_chain_info<T> &lhs_info,
+                           const cprog_chain_info<T> &rhs_info,
+                           const cprog_sym_integr<T> &lhs_sym,
+                           const cprog_sym_integr<T> &rhs_sym,
+                           module_chain_diff<T> &diff);
+  
+  // 递归匹配子树，找出相同的完整链
+  size_t match_subtrees(const cprog_chain_info<T> &lhs_info,
+                       const cprog_chain_info<T> &rhs_info,
+                       const cprog_data<T> &lhs_dir,
+                       const cprog_data<T> &rhs_dir,
+                       int level,
+                       std::vector<T> &path,
+                       std::vector<std::vector<T>> &common_chains);
+
+  // ============ 文本文件对比相关方法（保持原有） ============
+  
   struct offsets_hash {
     size_t operator()(const std::vector<T> &values) const noexcept {
       size_t seed = 0;
@@ -84,18 +114,8 @@ class ccompare : public base<T> {
   using module_chain_map =
       std::unordered_map<chain_module_key, chain_set, chain_module_key_hash>;
 
-  chain_collection parse_file(const std::string &path);
   chain_collection parse_txt_file(const std::string &path);
   bool parse_txt_line(const std::string &line, chain_signature<T> &out);
-  void validate_bin_file(FILE *file, const std::string &path);
-  void collect_module_chains(const cprog_chain_info<T> &info,
-                             const cprog_sym_integr<T> &sym,
-                             chain_collection &out);
-  void collect_from_dir(const cprog_chain_info<T> &info,
-                        const cprog_data<T> &dir, int level,
-                        std::vector<T> &offsets,
-                        const chain_signature<T> &base,
-                        chain_collection &out);
   module_chain_map build_chain_map(const chain_collection &chains);
   void process_module_diff(const chain_module_key &key, const chain_set *lhs,
                            const chain_set *rhs, bin_compare_result<T> &result,
