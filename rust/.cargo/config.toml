@@ -1,0 +1,22 @@
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+# Windows NDK 路径示例 (请根据实际 NDK 安装位置修改):
+linker = "D:/ndkollvm/android-ndk-r27c-windows/android-ndk-r27c/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
+
+# Linux NDK 路径示例:
+# linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+
+# 使用 cargo-ndk 时可以注释掉 linker 配置，直接用:
+# cargo ndk -t arm64-v8a build --release
+
+# 临时方案：使用 rust-lld 作为 linker (需要目标机器上运行)
+#linker = "rust-lld"
+#rustflags = ["-C", "linker-flavor=ld.lld"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# 本地开发时可以临时覆盖：
+# cargo build --target x86_64-unknown-linux-gnu
