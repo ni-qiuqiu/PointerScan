@@ -29,7 +29,7 @@ struct list_head {
     list_head() : next(nullptr){};
 };
 
-static auto thread_pool(std::make_unique<threadpool>(std::thread::hardware_concurrency() * 1.5));
+inline auto thread_pool(std::make_unique<threadpool>(std::thread::hardware_concurrency() * 1.5));
 
 template <typename T>
 void free_container_data(T &container);

@@ -176,9 +176,9 @@ private:
     bool released_;
     
 public:
-    BufferGuard(BufferPool& pool) 
+    BufferGuard(BufferPool& pool, int timeout_ms = 5000)
         : pool_(&pool)
-        , buffer_(pool_->acquire())  // 获取缓冲区
+        , buffer_(pool_->acquire(timeout_ms))
         , released_(false)
     {}
     

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <list>
 #include <vector>
 #include <memory>
@@ -56,8 +57,8 @@ private:
 
 public:
   // 缓冲区池，用于高效管理扫描过程中的内存缓冲区
-  // 在 for_each_memory_call 中创建和销毁
-  static inline std::unique_ptr<BufferPool> buffer_pool_;
+  // 使用 shared_ptr 确保所有任务完成后才销毁
+  static inline std::shared_ptr<BufferPool> buffer_pool_;
 
   static inline std::list<vm_area_data *> vm_area_list; // 全局模块列表
 
@@ -93,22 +94,21 @@ template <class F, class... Args>
 void memtool::extend::employ_memory_block(size_t start, size_t size,
                                           memtool::vm_area_data *vma, F &&call,
                                           Args &&...args) {
-  // 【修复】使用带超时的缓冲区获取，防止死锁
-  char *buf = buffer_pool_->acquire(10000);  // 10秒超时
-  if (buf == nullptr) {
-    // 超时处理：记录警告并跳过此内存块
+  // 持有 shared_ptr 拷贝，防止主线程 reset 后 BufferPool 被提前销毁
+  auto pool = buffer_pool_;
+  if (!pool) {
+    printf("警告: 缓冲区池已销毁，跳过内存块 0x%lx\n", start);
+    return;
+  }
+
+  // RAII 管理缓冲区，确保异常安全
+  BufferGuard guard(*pool, 10000);  // 10秒超时
+  if (guard.get() == nullptr) {
     printf("警告: 获取缓冲区超时，跳过内存块 0x%lx\n", start);
     return;
   }
 
-  try {
-    call(buf, start, size, vma, std::forward<Args>(args)...);
-  } catch (...) {
-    buffer_pool_->release(buf);
-    throw;
-  }
-  
-  buffer_pool_->release(buf);
+  call(guard.get(), start, size, vma, std::forward<Args>(args)...);
 }
 
 template <class C, class F>
@@ -155,7 +155,7 @@ void memtool::extend::for_each_memory_call(size_t start, size_t end, bool rest,
   size_t thread_count = utils::thread_pool->size();
   size_t buffer_count = std::max(static_cast<size_t>(count), thread_count + 2);
   
-  buffer_pool_ = std::make_unique<BufferPool>(buffer_count, size);
+  buffer_pool_ = std::make_shared<BufferPool>(buffer_count, size);
 
   printf("for_each_memory_call count %zu, buffers %zu, threads %zu\n", 
          vm_area_vec.size(), buffer_count, thread_count);
@@ -180,26 +180,17 @@ void memtool::extend::for_each_memory_call(size_t start, size_t end, bool rest,
   // 等待所有线程完成
   utils::thread_pool->wait();
 
-  // BufferPool 会在 unique_ptr 析构时自动清理
+  // 释放主线程对 BufferPool 的引用
+  // 如果仍有任务持有 shared_ptr 拷贝，BufferPool 会在最后一个任务完成后销毁
   buffer_pool_.reset();
 }
 
 template <class C, class F>
 auto memtool::extend::for_each_memory_impl<C, F>::for_each_memory_area(
     size_t start, size_t end, bool rest, int count, int size, F &&call) {
-  std::vector<C> cache;
-
-  // 计算需要多少 size 大小的块
-  size_t total_blocks = 0;
-  for (auto &vma : vm_area_vec) {
-    if (vma->prot & PROT_READ) {
-      size_t mem_size = vma->end - vma->start;
-      total_blocks += DIV_ROUND_UP(mem_size, size);
-    }
-  }
-  
-  // 预分配内存
-  cache.reserve(total_blocks);
+  // 使用 deque 而非 vector：deque 的 emplace_back 不会使已有元素的引用失效
+  // 这保证了通过 std::ref(dat) 传给线程池任务的引用始终有效
+  std::deque<C> cache;
 
   // 统计处理的内存区域数量
   std::atomic<int> processed_count(0);

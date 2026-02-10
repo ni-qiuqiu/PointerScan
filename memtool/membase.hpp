@@ -64,16 +64,23 @@ public:
 
 inline int memtool::base::get_pid(const char *package)
 {
+    // 验证包名只包含合法字符，防止命令注入
+    for (const char *p = package; *p; ++p) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) {
+            return -1;
+        }
+    }
 
-    //使用pidof 
-    char command[100];
+    char command[256];
     snprintf(command, sizeof(command), "pidof %s", package);
     FILE *fp = popen(command, "r");
     if (fp == nullptr) {
         return -1;
     }
-    char pid[10];
-    fscanf(fp, "%s", pid);
+    char pid[32] = {0};
+    fscanf(fp, "%31s", pid);
     pclose(fp);
     return atoi(pid);
 }
