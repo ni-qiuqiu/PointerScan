@@ -71,7 +71,7 @@ newscan --compare-txt --lhs <旧文件> --rhs <新文件> [--report 输出文件
 | `--process` | `-p` | 目标进程名称或 PID | — |
 | `--address` | `-a` | 目标地址（16 进制，不带 0x 前缀） | — |
 | `--depth` | `-d` | 最大搜索深度 | 10 |
-| `--offset` | `-o` | 最大偏移量（10 进制） | 500 |
+| `--offset` | `-o` | 最大偏移量（16 进制，不带 0x 前缀） | 500 |
 | `--limit` | `-l` | 结果限制数量（0 为不限制） | 0 |
 | `--file` | `-f` | 输出文件名 | `pointer_chains.txt` |
 | `--compare-bin` | — | 比较两份指针链二进制文件 | — |

@@ -38,7 +38,7 @@ int main(int argc, char *argv[]) {
   parser.addOption({'p', "process", "目标进程名称或PID", true, false});
   parser.addOption({'a', "address", "目标地址(16进制，不带0x前缀)", true, false});
   parser.addOption({'d', "depth", "最大搜索深度", true, false, "10"});
-  parser.addOption({'o', "offset", "最大偏移量(10进制)", true, false, "500"});
+  parser.addOption({'o', "offset", "最大偏移量(16进制，不带0x前缀)", true, false, "500"});
   parser.addOption({'l', "limit", "结果限制数量", true, false, "0"});
   parser.addOption({'f', "file", "输出文件名", true, false, "pointer_chains.txt"});
   parser.addOption({0, "compare-bin", "比较两份指针链二进制文件", false, false});
@@ -174,7 +174,7 @@ int main(int argc, char *argv[]) {
 
   // 获取命令行参数
   uint32_t max_depth = parser.getIntOption("depth", 5);
-  uint32_t max_offset = parser.getIntOption("offset", 500);
+  uint32_t max_offset = static_cast<uint32_t>(std::stoul(parser.getOptionValue("offset", "500"), nullptr, 16));
 
   // 第二步：初始化扫描器
   memtool::base::target_pid = target_pid;
