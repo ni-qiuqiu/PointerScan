@@ -3,10 +3,10 @@
 #include "ccompare.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -93,7 +93,22 @@ size_t ccompare<T>::count_chains_in_tree(const cprog_chain_info<T> &info) {
   return total;
 }
 
-// ============ 方案三：树上递归匹配子树 ============
+// ============ 将匹配链写入文件 ============
+
+template <class T>
+void ccompare<T>::emit_chain_line(FILE *f, const char *module_name,
+                                   int module_index,
+                                   const std::vector<T> &path) {
+  if (f == nullptr || path.empty()) return;
+  fprintf(f, "    = %s[%d]", module_name, module_index);
+  for (size_t i = 0; i < path.size(); ++i) {
+    fprintf(f, "%s 0x%lX", (i == 0 ? " + " : " -> + "),
+            static_cast<unsigned long>(path[i]));
+  }
+  fputc('\n', f);
+}
+
+// ============ 树上递归匹配子树 ============
 
 template <class T>
 size_t ccompare<T>::match_subtrees(
@@ -103,11 +118,14 @@ size_t ccompare<T>::match_subtrees(
     const cprog_data<T> &rhs_dir,
     int level,
     std::vector<T> &path,
-    std::vector<std::vector<T>> &common_chains)
+    const char *module_name, int module_index,
+    FILE *report)
 {
   if (level == 0) {
-    // 叶子节点，找到一条相同的链
-    common_chains.push_back(path);
+    // 叶子节点：找到一条匹配链，直接写入文件
+    if (report != nullptr) {
+      emit_chain_line(report, module_name, module_index, path);
+    }
     return 1;
   }
 
@@ -118,33 +136,41 @@ size_t ccompare<T>::match_subtrees(
     return 0;
   }
 
-  size_t count = 0;
   auto &lhs_children = lhs_info.contents[child_level];
   auto &rhs_children = rhs_info.contents[child_level];
 
-  // 构建 rhs 子节点的 offset 索引
-  std::unordered_map<T, std::vector<uint32_t>> rhs_offset_map;
-  for (uint32_t i = rhs_dir.start; i < rhs_dir.end && i < rhs_children.size(); ++i) {
-    T offset = rhs_children[i].address - rhs_dir.value;
-    rhs_offset_map[offset].push_back(i);
+  // 构建 rhs 子节点的 offset 索引：排序数组 + lower_bound
+  std::vector<std::pair<T, uint32_t>> rhs_sorted;
+  uint32_t rhs_end = std::min(rhs_dir.end, static_cast<uint32_t>(rhs_children.size()));
+  if (rhs_end > rhs_dir.start) {
+    rhs_sorted.reserve(rhs_end - rhs_dir.start);
+    for (uint32_t i = rhs_dir.start; i < rhs_end; ++i) {
+      rhs_sorted.emplace_back(rhs_children[i].address - rhs_dir.value, i);
+    }
+    std::sort(rhs_sorted.begin(), rhs_sorted.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
   }
 
-  // 遍历 lhs 子节点，只处理在 rhs 中也存在的（剪枝）
+  size_t count = 0;
+
   for (uint32_t i = lhs_dir.start; i < lhs_dir.end && i < lhs_children.size(); ++i) {
     T lhs_offset = lhs_children[i].address - lhs_dir.value;
 
-    auto it = rhs_offset_map.find(lhs_offset);
-    if (it == rhs_offset_map.end()) continue;  // 剪枝：rhs 中不存在此 offset
+    // 二分查找匹配的 rhs 子节点
+    auto lo = std::lower_bound(
+        rhs_sorted.begin(), rhs_sorted.end(), lhs_offset,
+        [](const auto &elem, const T &val) { return elem.first < val; });
 
-    // 记录当前偏移到路径
+    if (lo == rhs_sorted.end() || lo->first != lhs_offset) continue;
+
     path.push_back(lhs_offset);
 
-    // 对每个匹配的 rhs 子节点递归
-    for (uint32_t rhs_idx : it->second) {
+    for (auto it = lo; it != rhs_sorted.end() && it->first == lhs_offset; ++it) {
       count += match_subtrees(
           lhs_info, rhs_info,
-          lhs_children[i], rhs_children[rhs_idx],
-          child_level, path, common_chains
+          lhs_children[i], rhs_children[it->second],
+          child_level, path,
+          module_name, module_index, report
       );
     }
 
@@ -154,7 +180,7 @@ size_t ccompare<T>::match_subtrees(
   return count;
 }
 
-// ============ 方案三：匹配模块根节点 ============
+// ============ 匹配模块根节点 ============
 
 template <class T>
 size_t ccompare<T>::match_module_roots(
@@ -162,36 +188,48 @@ size_t ccompare<T>::match_module_roots(
     const cprog_chain_info<T> &rhs_info,
     const cprog_sym_integr<T> &lhs_sym,
     const cprog_sym_integr<T> &rhs_sym,
-    module_chain_diff<T> &diff)
+    FILE *report)
 {
   if (lhs_sym.sym == nullptr || rhs_sym.sym == nullptr) return 0;
   if (lhs_sym.data.size() == 0 || rhs_sym.data.size() == 0) return 0;
 
   size_t count = 0;
 
-  // 构建 rhs 根节点的 offset 索引
-  std::unordered_map<T, std::vector<size_t>> rhs_root_map;
+  // 构建 rhs 根节点的 offset 索引：排序数组
+  std::vector<std::pair<T, size_t>> rhs_sorted;
+  rhs_sorted.reserve(rhs_sym.data.size());
   for (size_t i = 0; i < rhs_sym.data.size(); ++i) {
-    T offset = rhs_sym.data[i].address - rhs_sym.sym->start;
-    rhs_root_map[offset].push_back(i);
+    rhs_sorted.emplace_back(rhs_sym.data[i].address - rhs_sym.sym->start, i);
+  }
+  std::sort(rhs_sorted.begin(), rhs_sorted.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+
+  // 在循环外创建 path 并复用
+  std::vector<T> path;
+  path.reserve(lhs_sym.sym->level + 1);
+
+  if (report != nullptr) {
+    fprintf(report, "  保持不变的链:\n");
   }
 
-  // 遍历 lhs 根节点
   for (size_t i = 0; i < lhs_sym.data.size(); ++i) {
     T lhs_offset = lhs_sym.data[i].address - lhs_sym.sym->start;
 
-    auto it = rhs_root_map.find(lhs_offset);
-    if (it == rhs_root_map.end()) continue;  // rhs 中不存在此根 offset
+    auto lo = std::lower_bound(
+        rhs_sorted.begin(), rhs_sorted.end(), lhs_offset,
+        [](const auto &elem, const T &val) { return elem.first < val; });
 
-    // 对每个匹配的 rhs 根节点递归匹配子树
-    for (size_t rhs_idx : it->second) {
-      std::vector<T> path;
-      path.push_back(lhs_offset);  // 根偏移
+    if (lo == rhs_sorted.end() || lo->first != lhs_offset) continue;
+
+    for (auto it = lo; it != rhs_sorted.end() && it->first == lhs_offset; ++it) {
+      path.clear();
+      path.push_back(lhs_offset);
 
       count += match_subtrees(
           lhs_info, rhs_info,
-          lhs_sym.data[i], rhs_sym.data[rhs_idx],
-          lhs_sym.sym->level, path, diff.common
+          lhs_sym.data[i], rhs_sym.data[it->second],
+          lhs_sym.sym->level, path,
+          lhs_sym.sym->name, lhs_sym.sym->count, report
       );
     }
   }
@@ -199,12 +237,13 @@ size_t ccompare<T>::match_module_roots(
   return count;
 }
 
-// ============ 方案三：二进制文件对比主函数 ============
+// ============ 二进制文件对比主函数 ============
 
 template <class T>
 bin_compare_result<T> ccompare<T>::compare_bin_files(
     const std::string &lhs_path,
-    const std::string &rhs_path)
+    const std::string &rhs_path,
+    FILE *report)
 {
   // 打开并验证文件
   std::unique_ptr<FILE, decltype(&fclose)> lhs_file(
@@ -248,22 +287,29 @@ bin_compare_result<T> ccompare<T>::compare_bin_files(
 
     chain_module_key key(lhs_sym.sym->name, lhs_sym.sym->count);
     auto it = rhs_module_map.find(key);
-    if (it == rhs_module_map.end()) continue;  // rhs 中无此模块
+    if (it == rhs_module_map.end()) continue;
 
     const cprog_sym_integr<T> *rhs_sym = it->second;
 
-    // 创建模块差异记录
-    module_chain_diff<T> diff;
-    diff.module_name = lhs_sym.sym->name;
-    diff.module_index = lhs_sym.sym->count;
+    if (report != nullptr) {
+      fprintf(report, "模块: %s[%d]\n", lhs_sym.sym->name, lhs_sym.sym->count);
+    }
 
-    // 在树上匹配根节点和子树
+    // 在树上匹配根节点和子树，匹配链直接写入 report
     size_t common_count = match_module_roots(
-        lhs_info, rhs_info, lhs_sym, *rhs_sym, diff);
+        lhs_info, rhs_info, lhs_sym, *rhs_sym, report);
 
-    if (!diff.common.empty()) {
+    if (common_count > 0) {
+      module_chain_diff<T> diff;
+      diff.module_name = lhs_sym.sym->name;
+      diff.module_index = lhs_sym.sym->count;
+      diff.common_count = common_count;
       result.modules.push_back(std::move(diff));
       total_common += common_count;
+    }
+
+    if (report != nullptr) {
+      fprintf(report, "\n");
     }
   }
 
@@ -271,66 +317,49 @@ bin_compare_result<T> ccompare<T>::compare_bin_files(
   return result;
 }
 
-// ============ 文本文件对比（保持原有实现） ============
+// ============ 文本文件对比 ============
 
 template <class T>
 bool ccompare<T>::parse_txt_line(const std::string &line,
                                  chain_signature<T> &out) {
-  std::string s = line;
-  auto not_space = [](int ch) { return !std::isspace(ch); };
-  s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
-    s.pop_back();
-  }
-  if (s.empty()) {
-    return false;
-  }
+  const char *p = line.c_str();
+  const char *end = p + line.size();
 
-  auto left_bracket = s.find('[');
-  auto right_bracket = s.find(']', left_bracket == std::string::npos
-                                       ? std::string::npos
-                                       : left_bracket + 1);
-  if (left_bracket == std::string::npos || right_bracket == std::string::npos ||
-      right_bracket <= left_bracket) {
-    return false;
-  }
+  // 跳过前导空白
+  while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+  if (p >= end) return false;
 
-  out.module_name = s.substr(0, left_bracket);
+  // 查找 '[' — 模块名结束
+  const char *bracket_l = static_cast<const char*>(std::memchr(p, '[', end - p));
+  if (bracket_l == nullptr || bracket_l == p) return false;
 
-  std::string index_str =
-      s.substr(left_bracket + 1, right_bracket - left_bracket - 1);
-  try {
-    out.module_index = std::stoi(index_str);
-  } catch (...) {
-    return false;
-  }
+  out.module_name.assign(p, bracket_l);
 
+  // 解析 module_index
+  const char *idx_start = bracket_l + 1;
+  char *idx_end = nullptr;
+  long idx_val = std::strtol(idx_start, &idx_end, 10);
+  if (idx_end == idx_start || idx_end >= end || *idx_end != ']') return false;
+  out.module_index = static_cast<int>(idx_val);
+
+  // 从 ']' 之后解析偏移
   out.offsets.clear();
+  p = idx_end + 1;
 
-  std::string rest = s.substr(right_bracket + 1);
-  std::size_t pos = 0;
-  while (true) {
-    auto plus_pos = rest.find("+ 0x", pos);
-    if (plus_pos == std::string::npos) {
-      break;
-    }
-    plus_pos += 4;
-    std::size_t end_pos = plus_pos;
-    while (end_pos < rest.size() &&
-           std::isxdigit(static_cast<unsigned char>(rest[end_pos]))) {
-      ++end_pos;
-    }
-    if (end_pos == plus_pos) {
-      break;
-    }
-    std::string hex_str = rest.substr(plus_pos, end_pos - plus_pos);
-    std::istringstream iss(hex_str);
-    std::size_t value = 0;
-    iss >> std::hex >> value;
-    if (!iss.fail()) {
-      out.offsets.emplace_back(static_cast<T>(value));
-    }
-    pos = end_pos;
+  while (p < end) {
+    // 查找 "+ 0x"
+    const char *plus = std::strstr(p, "+ 0x");
+    if (plus == nullptr) break;
+
+    const char *hex_start = plus + 4;
+    if (hex_start >= end) break;
+
+    char *hex_end = nullptr;
+    unsigned long value = std::strtoul(hex_start, &hex_end, 16);
+    if (hex_end == hex_start) break;
+
+    out.offsets.emplace_back(static_cast<T>(value));
+    p = hex_end;
   }
 
   return !out.offsets.empty();
@@ -344,11 +373,12 @@ auto ccompare<T>::parse_txt_file(const std::string &path) -> chain_collection {
   }
 
   chain_collection result;
+  result.reserve(4096);
   std::string line;
   chain_signature<T> sig;
   while (std::getline(in, line)) {
     if (parse_txt_line(line, sig)) {
-      result.emplace_back(sig);
+      result.emplace_back(std::move(sig));
     }
   }
   return result;

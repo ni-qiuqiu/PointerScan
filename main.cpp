@@ -78,20 +78,6 @@ int main(int argc, char *argv[]) {
     auto lhs_path = parser.getOptionValue("lhs");
     auto rhs_path = parser.getOptionValue("rhs");
 
-    chainer::ccompare<size_t> comparer;
-    chainer::bin_compare_result<size_t> compare_result;
-
-    try {
-      if (compare_bin_mode) {
-        compare_result = comparer.compare_bin_files(lhs_path, rhs_path);
-      } else {
-        compare_result = comparer.compare_txt_files(lhs_path, rhs_path);
-      }
-    } catch (const std::exception &ex) {
-      std::cerr << "错误: " << ex.what() << std::endl;
-      return 1;
-    }
-
     std::string report_path =
         parser.getOptionValue("report", "chain_compare.txt");
     FILE *report = fopen(report_path.c_str(), "w");
@@ -99,42 +85,59 @@ int main(int argc, char *argv[]) {
       std::cerr << "警告: 无法创建报告文件: " << report_path << std::endl;
     }
 
-    auto emit_line = [&](const std::string &line) {
-      //printf("%s\n", line.c_str());
-      if (report != nullptr) {
-        fprintf(report, "%s\n", line.c_str());
+    chainer::ccompare<size_t> comparer;
+    chainer::bin_compare_result<size_t> compare_result;
+
+    try {
+      if (compare_bin_mode) {
+        // 二进制对比：匹配链直接流式写入 report，不存储在内存中
+        if (report != nullptr) {
+          fprintf(report, "=== 指针链二进制文件对比结果 ===\n\n");
+        }
+        compare_result = comparer.compare_bin_files(lhs_path, rhs_path, report);
+      } else {
+        compare_result = comparer.compare_txt_files(lhs_path, rhs_path);
       }
-    };
-
-    if (compare_bin_mode) {
-      emit_line("=== 指针链二进制文件对比结果 ===");
-    } else {
-      emit_line("=== 指针链文本文件对比结果 ===");
+    } catch (const std::exception &ex) {
+      if (report != nullptr) fclose(report);
+      std::cerr << "错误: " << ex.what() << std::endl;
+      return 1;
     }
-    emit_line("旧文件链数量: " + std::to_string(compare_result.lhs_total));
-    emit_line("新文件链数量: " + std::to_string(compare_result.rhs_total));
-    emit_line("保持不变链数量: " + std::to_string(compare_result.unchanged));
-    emit_line("");
 
-    if (compare_result.modules.empty()) {
-      emit_line("未找到共同存在的指针链。");
-    } else {
-      for (const auto &diff : compare_result.modules) {
-        emit_line("模块: " + diff.module_name + "[" +
-                  std::to_string(diff.module_index) + "]");
-        if (!diff.common.empty()) {
-          emit_line("  保持不变的链:");
-          for (const auto &chain : diff.common) {
-            emit_line("    = " +
-                      format_chain_line(diff.module_name, diff.module_index,
-                                        chain));
+    // 写入统计摘要
+    if (report != nullptr) {
+      if (compare_txt_mode) {
+        fprintf(report, "=== 指针链文本文件对比结果 ===\n\n");
+      }
+
+      // 二进制模式下链详情已在比较过程中写入，这里追加统计
+      fprintf(report, "--- 统计 ---\n");
+      fprintf(report, "旧文件链数量: %zu\n", compare_result.lhs_total);
+      fprintf(report, "新文件链数量: %zu\n", compare_result.rhs_total);
+      fprintf(report, "保持不变链数量: %zu\n", compare_result.unchanged);
+      fprintf(report, "\n");
+
+      if (compare_txt_mode) {
+        // 文本对比：链存储在内存中，在此输出
+        if (compare_result.modules.empty()) {
+          fprintf(report, "未找到共同存在的指针链。\n");
+        } else {
+          for (const auto &diff : compare_result.modules) {
+            fprintf(report, "模块: %s[%d]\n", diff.module_name.c_str(),
+                    diff.module_index);
+            if (!diff.common.empty()) {
+              fprintf(report, "  保持不变的链:\n");
+              for (const auto &chain : diff.common) {
+                fprintf(report, "    = %s\n",
+                        format_chain_line(diff.module_name, diff.module_index,
+                                          chain).c_str());
+              }
+            }
+            fprintf(report, "\n");
           }
         }
-        emit_line("");
       }
-    }
 
-    if (report != nullptr) {
       fclose(report);
       printf("对比报告已保存至: %s\n", report_path.c_str());
     }

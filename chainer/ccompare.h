@@ -46,7 +46,8 @@ template <class T>
 struct module_chain_diff {
   std::string module_name;
   int module_index = 0;
-  // 只保留在两份文件中都存在的指针链（按模块+偏移路径完全一致）
+  size_t common_count = 0;
+  // 文本对比时存储完整路径；二进制对比时为空（直接流式写入文件）
   std::vector<std::vector<T>> common;
 };
 
@@ -61,39 +62,45 @@ struct bin_compare_result {
 template <class T>
 class ccompare : public base<T> {
  public:
-  // 二进制文件对比（方案三：树上直接查找，高效低内存）
+  // 二进制文件对比（树上直接查找，高效低内存）
+  // report 非空时，匹配到的链直接流式写入文件，不存储在内存中
   bin_compare_result<T> compare_bin_files(const std::string &lhs_path,
-                                          const std::string &rhs_path);
-  // 文本文件对比（保持原有实现）
+                                          const std::string &rhs_path,
+                                          FILE *report = nullptr);
+  // 文本文件对比
   bin_compare_result<T> compare_txt_files(const std::string &lhs_path,
                                           const std::string &rhs_path);
 
  private:
-  // ============ 方案三：树上直接查找相关方法 ============
-  
-  // 验证二进制文件格式
+  // ============ 二进制对比相关方法 ============
+
   void validate_bin_file(FILE *file, const std::string &path);
-  
-  // 统计单个文件的链总数（不展开，直接在树上计算）
+
   size_t count_chains_in_tree(const cprog_chain_info<T> &info);
   size_t count_chains_recursive(const cprog_chain_info<T> &info,
                                 const cprog_data<T> &dir, int level);
-  
-  // 在树上匹配模块的根节点
+
+  // 匹配模块根节点，返回匹配链数
   size_t match_module_roots(const cprog_chain_info<T> &lhs_info,
                            const cprog_chain_info<T> &rhs_info,
                            const cprog_sym_integr<T> &lhs_sym,
                            const cprog_sym_integr<T> &rhs_sym,
-                           module_chain_diff<T> &diff);
-  
-  // 递归匹配子树，找出相同的完整链
+                           FILE *report);
+
+  // 递归匹配子树，返回匹配链数
+  // 使用排序数组+二分查找替代 unordered_map
   size_t match_subtrees(const cprog_chain_info<T> &lhs_info,
                        const cprog_chain_info<T> &rhs_info,
                        const cprog_data<T> &lhs_dir,
                        const cprog_data<T> &rhs_dir,
                        int level,
                        std::vector<T> &path,
-                       std::vector<std::vector<T>> &common_chains);
+                       const char *module_name, int module_index,
+                       FILE *report);
+
+  // 将一条匹配链写入文件
+  static void emit_chain_line(FILE *f, const char *module_name,
+                               int module_index, const std::vector<T> &path);
 
   // ============ 文本文件对比相关方法（保持原有） ============
   
