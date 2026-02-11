@@ -27,7 +27,7 @@ int memtool::extend::det_mem_range(char *name, char *prems) {
     return memsetting::C_heap;
 
   if (strncmp(name, "[anon:libc_malloc", 17) == 0 ||
-      strncmp(name, "[anon:scudo:", 13) == 0)
+      strncmp(name, "[anon:scudo:", 12) == 0)
     return memsetting::C_alloc;
 
   if ((strstr(name, "/data/app/") != nullptr) &&
