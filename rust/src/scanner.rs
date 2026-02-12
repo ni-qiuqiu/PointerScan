@@ -16,7 +16,7 @@ use crate::error::{Result, ScanError};
 use crate::mapqueue::MapQueue;
 use crate::memory::VmAreaData;
 use crate::pointer::*;
-use crate::process::ProcessMemory;
+use crate::process::{ProcessMemory, ReadMode};
 
 /// 指针扫描结果
 pub struct PointerScanResult {
@@ -42,10 +42,25 @@ impl ChainScanner {
         })
     }
 
+    /// 创建指定读取模式的扫描器
+    pub fn with_mode(pid: i32, mode: ReadMode) -> Result<Self> {
+        let process = ProcessMemory::with_mode(pid, mode)?;
+        Ok(Self {
+            process,
+            global_pointers: Vec::new(),
+        })
+    }
+
     /// 通过进程名创建扫描器
     pub fn from_name(name: &str) -> Result<Self> {
         let pid = ProcessMemory::find_pid(name)?;
         Self::new(pid)
+    }
+
+    /// 通过进程名创建指定读取模式的扫描器
+    pub fn from_name_with_mode(name: &str, mode: ReadMode) -> Result<Self> {
+        let pid = ProcessMemory::find_pid(name)?;
+        Self::with_mode(pid, mode)
     }
 
     /// 获取潜在指针数据
@@ -65,6 +80,7 @@ impl ChainScanner {
         
         let scan_areas = self.process.scan_areas().to_vec();
         let pid = self.process.pid();
+        let read_mode = self.process.read_mode();
         
         // 获取扫描区域的地址范围（原项目逻辑）
         let min_addr = scan_areas.iter().map(|v| v.start).min().unwrap_or(0);
@@ -82,9 +98,10 @@ impl ChainScanner {
                  scan_areas.len(), thread_count);
 
         // 收集所有指针数据
+        // 过滤条件与 C++ 一致：可读或可写（prot & PROT_READ || prot & PROT_WRITE）
         let results: Vec<Vec<PointerData>> = scan_areas
             .par_iter()
-            .filter(|vma| vma.is_readable())
+            .filter(|vma| vma.prot.read || vma.prot.write)
             .flat_map(|vma| {
                 let mut blocks = Vec::new();
                 let mut addr = vma.start;
@@ -100,7 +117,7 @@ impl ChainScanner {
                 let buf = guard.as_mut_slice();
                 
                 // 读取内存块
-                let pm = ProcessMemory::new(pid).ok()?;
+                let pm = ProcessMemory::with_mode(pid, read_mode).ok()?;
                 let read_size = pm.read(addr, &mut buf[..size]).ok()?;
                 
                 // 扫描指针

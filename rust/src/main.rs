@@ -11,6 +11,7 @@ use std::fs::File;
 
 use pointer_chain_scanner::{ChainScanner, Result, ScanError};
 use pointer_chain_scanner::memory::MemRange;
+use pointer_chain_scanner::process::ReadMode;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
     let mut offset = 0x1000u64;
     let mut output_path = String::from("chains.bin");
     let mut text_output = false;
+    let mut use_io = false;
     // 原项目默认: Anonymous + C_alloc + C_bss + C_data
     let mut scan_ranges = MemRange::Anonymous as i32 
                         | MemRange::CAlloc as i32 
@@ -59,6 +61,9 @@ fn main() -> Result<()> {
             "-t" | "--text" => {
                 text_output = true;
             }
+            "--io" => {
+                use_io = true;
+            }
             "-r" | "--ranges" => {
                 if i + 1 < args.len() {
                     scan_ranges = parse_ranges(&args[i + 1]);
@@ -82,11 +87,18 @@ fn main() -> Result<()> {
     }
 
     // 创建扫描器
+    let read_mode = if use_io {
+        println!("使用 /proc/pid/mem IO 读取模式");
+        ReadMode::ProcMemIo
+    } else {
+        ReadMode::ProcessVmReadv
+    };
+
     println!("Initializing scanner...");
     let mut scanner = if let Ok(pid) = target.parse::<i32>() {
-        ChainScanner::new(pid)?
+        ChainScanner::with_mode(pid, read_mode)?
     } else {
-        ChainScanner::from_name(target)?
+        ChainScanner::from_name_with_mode(target, read_mode)?
     };
 
     println!("Target: {}", target);
@@ -157,6 +169,7 @@ fn print_usage(program: &str) {
     println!("  -o, --offset <N>    Max offset (default: 0x1000)");
     println!("  -f, --file <path>   Output file path (default: chains.bin)");
     println!("  -t, --text          Also output text format");
+    println!("  --io                Use /proc/pid/mem IO read (fix unreadable memory)");
     println!("  -r, --ranges <N>    Memory ranges to scan (bitmask)");
     println!("  -h, --help          Show this help message");
     println!();

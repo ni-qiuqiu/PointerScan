@@ -48,6 +48,7 @@ int main(int argc, char *argv[]) {
   parser.addOption({0, "report", "对比输出文件名", true, false,
                     "chain_compare.txt"});
   parser.addOption({'v', "verbose", "详细输出模式", false, false});
+  parser.addOption({0, "io", "使用/proc/pid/mem IO读取内存(解决不可读内存问题)", false, false});
   parser.addOption({'h', "help", "显示帮助信息", false, false});
 
   // 设置用法说明
@@ -178,6 +179,13 @@ int main(int argc, char *argv[]) {
 
   // 第二步：初始化扫描器
   memtool::base::target_pid = target_pid;
+
+  // 设置内存读取模式
+  if (parser.getBoolOption("io", false)) {
+    memtool::base::mode = memtool::read_mode::PROC_MEM_IO;
+    printf("使用 /proc/%d/mem IO 读取模式\n", target_pid);
+  }
+
   chainer::cscan<size_t> scanner;  // 64位进程，32位使用 uint32_t
 
   // 第三步：获取目标进程内存布局

@@ -1,14 +1,26 @@
 //! 进程内存读取模块
-//! 
-//! 使用 process_vm_readv 系统调用读取目标进程内存
+//!
+//! 支持两种读取模式：
+//! - process_vm_readv 系统调用（默认）
+//! - /proc/[pid]/mem 文件IO读取（解决不可读内存问题）
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use crate::error::{Result, ScanError};
 use crate::memory::{MemRange, VmAreaData, VmStaticData};
+
+/// 内存读取模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMode {
+    /// 默认：process_vm_readv 系统调用
+    ProcessVmReadv,
+    /// /proc/[pid]/mem 文件IO读取
+    ProcMemIo,
+}
 
 /// 进程内存访问器
 pub struct ProcessMemory {
@@ -20,20 +32,43 @@ pub struct ProcessMemory {
     scan_areas: Vec<VmAreaData>,
     /// 静态模块列表
     static_modules: Vec<VmStaticData>,
+    /// 读取模式
+    read_mode: ReadMode,
+    /// /proc/[pid]/mem 文件描述符（IO模式使用）
+    mem_file: Option<File>,
 }
 
 impl ProcessMemory {
     /// 创建进程内存访问器
     pub fn new(pid: i32) -> Result<Self> {
+        Self::with_mode(pid, ReadMode::ProcessVmReadv)
+    }
+
+    /// 创建指定读取模式的进程内存访问器
+    pub fn with_mode(pid: i32, read_mode: ReadMode) -> Result<Self> {
+        let mem_file = if read_mode == ReadMode::ProcMemIo {
+            let path = format!("/proc/{}/mem", pid);
+            Some(File::open(&path).map_err(ScanError::Io)?)
+        } else {
+            None
+        };
+
         let mut pm = Self {
             pid,
             vm_areas: Vec::new(),
             scan_areas: Vec::new(),
             static_modules: Vec::new(),
+            read_mode,
+            mem_file,
         };
         pm.parse_maps()?;
         pm.parse_modules();
         Ok(pm)
+    }
+
+    /// 获取读取模式
+    pub fn read_mode(&self) -> ReadMode {
+        self.read_mode
     }
 
     /// 通过进程名获取 PID
@@ -126,6 +161,14 @@ impl ProcessMemory {
 
     /// 读取内存
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<usize> {
+        match self.read_mode {
+            ReadMode::ProcMemIo => self.read_mem_io(addr, buf),
+            ReadMode::ProcessVmReadv => self.read_vm_readv(addr, buf),
+        }
+    }
+
+    /// 通过 process_vm_readv 读取内存
+    fn read_vm_readv(&self, addr: u64, buf: &mut [u8]) -> Result<usize> {
         let local_iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
@@ -151,6 +194,38 @@ impl ProcessMemory {
         } else {
             Ok(result as usize)
         }
+    }
+
+    /// 通过 /proc/[pid]/mem 文件IO读取内存
+    /// 按页分段读取，单页失败时填零跳过，避免整块数据丢失
+    fn read_mem_io(&self, addr: u64, buf: &mut [u8]) -> Result<usize> {
+        let file = self.mem_file.as_ref()
+            .ok_or_else(|| ScanError::ReadFailed(addr))?;
+        let fd = file.as_raw_fd();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let mut total = 0usize;
+
+        while total < buf.len() {
+            let chunk = (buf.len() - total).min(page_size);
+            let offset = addr as libc::off64_t + total as libc::off64_t;
+            let n = unsafe {
+                libc::pread64(
+                    fd,
+                    buf[total..].as_mut_ptr() as *mut libc::c_void,
+                    chunk,
+                    offset,
+                )
+            };
+            if n <= 0 {
+                // 该页不可读，填零跳过
+                buf[total..total + chunk].fill(0);
+                total += chunk;
+                continue;
+            }
+            total += n as usize;
+        }
+
+        Ok(total)
     }
 
     /// 读取指针值
