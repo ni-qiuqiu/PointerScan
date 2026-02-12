@@ -197,7 +197,7 @@ auto memtool::extend::for_each_memory_impl<C, F>::for_each_memory_area(
   
   auto for_each = [size, &call, &cache, &processed_count](
       auto mem_start, auto mem_end, auto vma) {
-    if (vma->prot & PROT_READ) {
+    if (vma->prot & PROT_READ|| vma->prot & PROT_WRITE) {
       processed_count.fetch_add(1, std::memory_order_relaxed);
       divide_memory_to_block(mem_start, mem_end, vma, size, cache, call);
     }
@@ -213,7 +213,7 @@ template <class F>
 void memtool::extend::for_each_memory_impl<void, F>::for_each_memory_area(
     size_t start, size_t end, bool rest, int count, int size, F &&call) {
   auto for_each = [size, &call](auto mem_start, auto mem_end, auto vma) {
-    if (vma->prot & PROT_READ) {
+    if (vma->prot & PROT_READ|| vma->prot & PROT_WRITE) {
       divide_memory_to_block(mem_start, mem_end, vma, size, call);
     }
   };
