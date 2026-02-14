@@ -12,6 +12,7 @@ pub mod buffer_pool;
 pub mod pointer;
 pub mod scanner;
 pub mod process;
+pub mod compare;
 
 #[cfg(test)]
 mod tests;

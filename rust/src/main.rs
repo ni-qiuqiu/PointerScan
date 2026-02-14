@@ -2,20 +2,38 @@
 //!
 //! 用法:
 //!   scanner <pid|process_name> <target_address> [options]
+//!   scanner --compare-bin --lhs <旧文件> --rhs <新文件> [--report <输出>]
+//!   scanner --compare-txt --lhs <旧文件> --rhs <新文件> [--report <输出>]
 //!
 //! 示例:
 //!   scanner 1234 0x7f8a4c000000 -d 5 -o 0x1000
-//!   scanner com.example.app 0x12345678 --depth 3
+//!   scanner --compare-bin --lhs old.bin --rhs new.bin --report diff.txt
 
 use std::fs::File;
+use std::io::Write;
 
 use pointer_chain_scanner::{ChainScanner, Result, ScanError};
+use pointer_chain_scanner::compare;
 use pointer_chain_scanner::memory::MemRange;
 use pointer_chain_scanner::process::ReadMode;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    
+
+    if args.len() < 2 {
+        print_usage(&args[0]);
+        return Ok(());
+    }
+
+    // 检查是否为对比模式
+    let compare_bin = args.iter().any(|a| a == "--compare-bin");
+    let compare_txt = args.iter().any(|a| a == "--compare-txt");
+
+    if compare_bin || compare_txt {
+        return run_compare(&args, compare_bin);
+    }
+
+    // 扫描模式需要至少 3 个参数
     if args.len() < 3 {
         print_usage(&args[0]);
         return Ok(());
@@ -155,22 +173,114 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_compare(args: &[String], is_bin: bool) -> Result<()> {
+    let mut lhs_path = String::new();
+    let mut rhs_path = String::new();
+    let mut report_path = String::from("chain_compare.txt");
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lhs" => {
+                if i + 1 < args.len() {
+                    lhs_path = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--rhs" => {
+                if i + 1 < args.len() {
+                    rhs_path = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--report" => {
+                if i + 1 < args.len() {
+                    report_path = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if lhs_path.is_empty() || rhs_path.is_empty() {
+        eprintln!("错误: 对比模式需要提供 --lhs 与 --rhs 选项");
+        return Err(ScanError::InvalidChain);
+    }
+
+    if is_bin {
+        // 二进制对比：report 在 compare_bin_files 内部流式写入
+        let result = compare::compare_bin_files(&lhs_path, &rhs_path, Some(&report_path))?;
+        println!("旧文件链数量: {}", result.lhs_total);
+        println!("新文件链数量: {}", result.rhs_total);
+        println!("保持不变链数量: {}", result.unchanged);
+    } else {
+        // 文本对比
+        let result = compare::compare_txt_files(&lhs_path, &rhs_path)?;
+
+        let mut report = File::create(&report_path).map_err(ScanError::Io)?;
+        let _ = writeln!(report, "=== 指针链文本文件对比结果 ===\n");
+        let _ = writeln!(report, "--- 统计 ---");
+        let _ = writeln!(report, "旧文件链数量: {}", result.lhs_total);
+        let _ = writeln!(report, "新文件链数量: {}", result.rhs_total);
+        let _ = writeln!(report, "保持不变链数量: {}", result.unchanged);
+        let _ = writeln!(report);
+
+        if result.modules.is_empty() {
+            let _ = writeln!(report, "未找到共同存在的指针链。");
+        } else {
+            for diff in &result.modules {
+                let _ = writeln!(report, "模块: {}[{}]", diff.module_name, diff.module_index);
+                if !diff.common.is_empty() {
+                    let _ = writeln!(report, "  保持不变的链:");
+                    for chain in &diff.common {
+                        let _ = write!(report, "    = {}[{}]", diff.module_name, diff.module_index);
+                        for (j, &off) in chain.iter().enumerate() {
+                            if j == 0 {
+                                let _ = write!(report, " + 0x{:X}", off);
+                            } else {
+                                let _ = write!(report, " -> + 0x{:X}", off);
+                            }
+                        }
+                        let _ = writeln!(report);
+                    }
+                }
+                let _ = writeln!(report);
+            }
+        }
+
+        println!("旧文件链数量: {}", result.lhs_total);
+        println!("新文件链数量: {}", result.rhs_total);
+        println!("保持不变链数量: {}", result.unchanged);
+    }
+
+    println!("对比报告已保存至: {}", report_path);
+    Ok(())
+}
+
 fn print_usage(program: &str) {
     println!("BFS Pointer Chain Scanner - Rust ARM64 Implementation");
     println!();
-    println!("Usage: {} <pid|process_name> <target_address> [options]", program);
+    println!("Usage:");
+    println!("  [扫描] {} <pid|process_name> <target_address> [options]", program);
+    println!("  [对比] {} (--compare-bin|--compare-txt) --lhs <旧文件> --rhs <新文件> [--report <输出>]", program);
     println!();
-    println!("Arguments:");
-    println!("  <pid|process_name>  Target process PID or name");
-    println!("  <target_address>    Target address to scan (hex or decimal)");
-    println!();
-    println!("Options:");
+    println!("Scan Options:");
     println!("  -d, --depth <N>     Scan depth (default: 5)");
     println!("  -o, --offset <N>    Max offset (default: 0x1000)");
     println!("  -f, --file <path>   Output file path (default: chains.bin)");
     println!("  -t, --text          Also output text format");
     println!("  --io                Use /proc/pid/mem IO read (fix unreadable memory)");
     println!("  -r, --ranges <N>    Memory ranges to scan (bitmask)");
+    println!();
+    println!("Compare Options:");
+    println!("  --compare-bin       Compare two binary chain files");
+    println!("  --compare-txt       Compare two text chain files");
+    println!("  --lhs <path>        Old chain file path");
+    println!("  --rhs <path>        New chain file path");
+    println!("  --report <path>     Report output path (default: chain_compare.txt)");
+    println!();
     println!("  -h, --help          Show this help message");
     println!();
     println!("Memory Ranges:");
@@ -184,7 +294,7 @@ fn print_usage(program: &str) {
     println!();
     println!("Examples:");
     println!("  {} 1234 0x7f8a4c000000 -d 5 -o 0x1000", program);
-    println!("  {} com.example.app 0x12345678 --depth 3", program);
+    println!("  {} --compare-bin --lhs old.bin --rhs new.bin", program);
 }
 
 fn parse_hex_or_dec(s: &str) -> u64 {
