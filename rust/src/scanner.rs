@@ -407,8 +407,8 @@ impl ChainScanner {
 
             // start: 第一个 address >= value 的位置
             let start = prev_slice.partition_point(|p| p.address < value);
-            // end: 第一个 address > value + offset 的位置
-            let end = prev_slice.partition_point(|p| p.address <= value + offset);
+            // end: 第一个 address > value + offset 的位置（用 saturating_add 防溢出）
+            let end = prev_slice.partition_point(|p| p.address <= value.saturating_add(offset));
 
             dir.start = start as u32;
             dir.end = end as u32;
@@ -418,7 +418,7 @@ impl ChainScanner {
     }
 
     /// 为 range 结果创建索引
-    /// 
+    ///
     /// 与 create_assoc_dir_index_static 相同的逻辑
     fn create_assoc_range_index(
         &self,
@@ -432,8 +432,8 @@ impl ChainScanner {
             let value = dir.value;
             // start: 第一个 address >= value 的位置
             let start = prev_slice.partition_point(|p| p.address < value);
-            // end: 第一个 address > value + offset 的位置
-            let end = prev_slice.partition_point(|p| p.address <= value + offset);
+            // end: 第一个 address > value + offset 的位置（用 saturating_add 防溢出）
+            let end = prev_slice.partition_point(|p| p.address <= value.saturating_add(offset));
             dir.start = start as u32;
             dir.end = end as u32;
         }
@@ -462,18 +462,9 @@ impl ChainScanner {
             .map(|_| MapQueue::new())
             .collect();
 
-        // 构建 contents：收集每层的指针目录指针
+        // 构建 contents：只收集每层 dirs 的指针目录指针
+        // 注意：不能混入 ranges 条目，因为 dir.start/end 索引是相对于 dirs[level-1] 的
         for level in (0..=max_level).rev() {
-            // 从 ranges 收集该层的指针
-            for range in ranges.iter() {
-                if range.level as usize == level {
-                    for dir in range.results.iter() {
-                        contents[level].push(dir as *const PointerDir)?;
-                    }
-                }
-            }
-
-            // 从 dirs 收集该层的指针
             for dir in dirs[level].iter() {
                 contents[level].push(dir as *const PointerDir)?;
             }
