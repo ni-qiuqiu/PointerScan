@@ -261,6 +261,18 @@ void chainer::search<T>::search_pointer(P &&input, U &out, size_t offset,
 }
 
 template <class T>
+void chainer::search<T>::sort_pcoll_by_address()
+{
+    if (pcoll.size() <= 1) return;
+
+    // pcoll 底层是 mmap 文件，直接对其排序
+    std::sort(pcoll.begin(), pcoll.end(),
+              [](const pointer_data<T> &a, const pointer_data<T> &b) {
+                  return a.address < b.address;
+              });
+}
+
+template <class T>
 chainer::search<T>::search()
 {
 }

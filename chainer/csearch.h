@@ -42,6 +42,9 @@ public:
   void search_pointer(P &&input, U &out, size_t offset, bool rest,
                       size_t limit); // out.type = pointer_data<T> *
 
+  // 确保 pcoll 按 address 排序（正向路径扫描需要）
+  void sort_pcoll_by_address();
+
   search();
 
   ~search();

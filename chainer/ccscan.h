@@ -20,6 +20,11 @@ struct cscan : public ::chainer::scan<T>
     size_t scan_pointer_chain_to_txt(std::vector<T> &addr, int depth,
       size_t offset, bool limit, size_t plim, FILE *outstream);
     //将指针链转为文本格式输出到outstream中
+
+    // 正向指针路径扫描：从 source 出发，寻找到 dest 的指针路径
+    // 返回找到的路径数量
+    size_t scan_pointer_path(T source, T dest, int depth, size_t offset, FILE *outstream);
+
     cscan();
 
     ~cscan();

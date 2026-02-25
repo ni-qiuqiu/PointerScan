@@ -49,10 +49,14 @@ int main(int argc, char *argv[]) {
                     "chain_compare.txt"});
   parser.addOption({'v', "verbose", "详细输出模式", false, false});
   parser.addOption({0, "io", "使用/proc/pid/mem IO读取内存(解决不可读内存问题)", false, false});
+  parser.addOption({0, "path", "路径扫描模式：查找两个地址之间的指针路径", false, false});
+  parser.addOption({0, "from", "路径扫描的源地址(16进制)", true, false});
+  parser.addOption({0, "to", "路径扫描的目标地址(16进制)", true, false});
   parser.addOption({'h', "help", "显示帮助信息", false, false});
 
   // 设置用法说明
   parser.setUsage("[扫描] -p <进程名/PID> -a <地址> | "
+                  "[路径] -p <进程名/PID> --path --from <源地址> --to <目标地址> | "
                   "[对比] (--compare-bin|--compare-txt) --lhs <旧文件> --rhs <新文件>");
 
   // 解析命令行参数
@@ -142,6 +146,69 @@ int main(int argc, char *argv[]) {
       fclose(report);
       printf("对比报告已保存至: %s\n", report_path.c_str());
     }
+
+    return 0;
+  }
+
+  // ============ 路径扫描模式 ============
+  bool path_mode = parser.getBoolOption("path", false);
+  if (path_mode) {
+    if (!parser.hasOption("process")) {
+      std::cerr << "错误: 路径扫描模式需要提供目标进程 (-p/--process)" << std::endl;
+      return 1;
+    }
+    if (!parser.hasOption("from") || !parser.hasOption("to")) {
+      std::cerr << "错误: 路径扫描模式需要提供 --from 和 --to 地址" << std::endl;
+      return 1;
+    }
+
+    std::string target_process = parser.getOptionValue("process");
+    int target_pid = -1;
+    try {
+      target_pid = std::stoi(target_process);
+    } catch (...) {
+      target_pid = memtool::base::get_pid(target_process.c_str());
+      if (target_pid == -1) {
+        std::cerr << "错误: 无法找到进程: " << target_process << std::endl;
+        return 1;
+      }
+    }
+
+    printf("Target PID: %s -> %d\n", target_process.c_str(), target_pid);
+
+    uint32_t max_depth = parser.getIntOption("depth", 5);
+    uint32_t max_offset = static_cast<uint32_t>(
+        std::stoul(parser.getOptionValue("offset", "500"), nullptr, 16));
+
+    memtool::base::target_pid = target_pid;
+    if (parser.getBoolOption("io", false)) {
+      memtool::base::mode = memtool::read_mode::PROC_MEM_IO;
+      printf("使用 /proc/%d/mem IO 读取模式\n", target_pid);
+    }
+
+    chainer::cscan<size_t> scanner;
+    memtool::extend::get_target_mem();
+    memtool::extend::set_mem_ranges(memtool::Anonymous + memtool::C_alloc +
+                                    memtool::C_bss + memtool::C_data);
+
+    size_t pointer_count = scanner.get_pointers(0, 0, false, 10, 1 << 20);
+    printf("Found %ld potential pointers\n", pointer_count);
+
+    uint64_t from_addr = std::stoull(parser.getOptionValue("from"), nullptr, 16);
+    uint64_t to_addr = std::stoull(parser.getOptionValue("to"), nullptr, 16);
+
+    std::string output_file = parser.getOptionValue("file", "pointer_paths.txt");
+    FILE *output = fopen(output_file.c_str(), "w");
+    if (output == nullptr) {
+      std::cerr << "错误: 无法创建输出文件: " << output_file << std::endl;
+      return 1;
+    }
+
+    size_t path_count = scanner.scan_pointer_path(
+        static_cast<size_t>(from_addr), static_cast<size_t>(to_addr),
+        max_depth, max_offset, output);
+    printf("Total paths found: %ld\n", path_count);
+    fclose(output);
 
     return 0;
   }
