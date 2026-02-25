@@ -57,40 +57,84 @@ void ccompare<T>::validate_bin_file(FILE *file, const std::string &path) {
   rewind(file);
 }
 
-// ============ 方案三：树上直接统计链数量 ============
+// ============ 前缀和：O(N) 统计链数量 ============
 
 template <class T>
-size_t ccompare<T>::count_chains_recursive(const cprog_chain_info<T> &info,
-                                           const cprog_data<T> &dir,
-                                           int level) {
-  if (level == 0) {
-    return 1;  // 叶子节点，一条链
+auto ccompare<T>::build_prefix_sums(const cprog_chain_info<T> &info)
+    -> prefix_sums_t {
+  size_t level_count = info.contents.size();
+  prefix_sums_t prefix_sums;
+  prefix_sums.reserve(level_count);
+
+  for (size_t k = 0; k < level_count; ++k) {
+    auto &nodes = info.contents[k];
+    size_t n = nodes.size();
+    std::vector<uint64_t> prefix(n + 1, 0);
+
+    if (k == 0) {
+      // level 0: 每个节点 = 1 条链
+      for (size_t i = 0; i < n; ++i) {
+        prefix[i + 1] = prefix[i] + 1;
+      }
+    } else {
+      // level k: 每个节点的链数 = prefix_sums[k-1][end] - prefix_sums[k-1][start]
+      auto &prev = prefix_sums[k - 1];
+      size_t prev_len = prev.size();
+      for (size_t i = 0; i < n; ++i) {
+        size_t start = std::min(static_cast<size_t>(nodes[i].start), prev_len - 1);
+        size_t end = std::min(static_cast<size_t>(nodes[i].end), prev_len - 1);
+        uint64_t node_chains = prev[end] - prev[start];
+        prefix[i + 1] = prefix[i] + node_chains;
+      }
+    }
+
+    prefix_sums.push_back(std::move(prefix));
   }
 
-  int child_level = level - 1;
-  if (child_level < 0 || 
-      static_cast<size_t>(child_level) >= info.contents.size()) {
-    return 0;
-  }
-
-  size_t count = 0;
-  auto &children = info.contents[child_level];
-  for (uint32_t i = dir.start; i < dir.end && i < children.size(); ++i) {
-    count += count_chains_recursive(info, children[i], child_level);
-  }
-  return count;
+  return prefix_sums;
 }
 
 template <class T>
-size_t ccompare<T>::count_chains_in_tree(const cprog_chain_info<T> &info) {
-  size_t total = 0;
-  for (auto &sym : info.syms) {
-    if (sym.sym == nullptr || sym.data.size() == 0) continue;
-    for (size_t i = 0; i < sym.data.size(); ++i) {
-      total += count_chains_recursive(info, sym.data[i], sym.sym->level);
-    }
+uint64_t ccompare<T>::chains_of(const prefix_sums_t &prefix,
+                                 const cprog_data<T> &dir, int level) {
+  if (level == 0) return 1;
+  int child_level = level - 1;
+  if (child_level < 0 ||
+      static_cast<size_t>(child_level) >= prefix.size()) {
+    return 0;
   }
-  return total;
+  auto &prev = prefix[child_level];
+  size_t prev_len = prev.size();
+  size_t start = std::min(static_cast<size_t>(dir.start), prev_len - 1);
+  size_t end = std::min(static_cast<size_t>(dir.end), prev_len - 1);
+  return prev[end] - prev[start];
+}
+
+template <class T>
+size_t ccompare<T>::count_chains_prefix_sum(const cprog_chain_info<T> &info,
+                                             const char *label,
+                                             prefix_sums_t &out_prefix) {
+  out_prefix = build_prefix_sums(info);
+
+  uint64_t total = 0;
+  for (size_t idx = 0; idx < info.syms.size(); ++idx) {
+    auto &sym = info.syms[idx];
+    if (sym.sym == nullptr || sym.data.size() == 0) continue;
+    int level = sym.sym->level;
+    uint64_t sym_count = 0;
+    for (size_t i = 0; i < sym.data.size(); ++i) {
+      sym_count += chains_of(out_prefix, sym.data[i], level);
+    }
+    if (sym_count > 0) {
+      printf("  [%s] [%zu/%zu] %s[%d]: %llu 条链\n",
+             label, idx + 1, info.syms.size(),
+             sym.sym->name, sym.sym->count,
+             static_cast<unsigned long long>(sym_count));
+    }
+    total += sym_count;
+  }
+
+  return static_cast<size_t>(total);
 }
 
 // ============ 将匹配链写入文件 ============
@@ -108,21 +152,23 @@ void ccompare<T>::emit_chain_line(FILE *f, const char *module_name,
   fputc('\n', f);
 }
 
-// ============ 树上递归匹配子树 ============
+// ============ 树上递归匹配子树（双指针归并 + 前缀和剪枝 + level 1 快速路径） ============
 
 template <class T>
 size_t ccompare<T>::match_subtrees(
     const cprog_chain_info<T> &lhs_info,
     const cprog_chain_info<T> &rhs_info,
+    const prefix_sums_t &lhs_prefix,
+    const prefix_sums_t &rhs_prefix,
     const cprog_data<T> &lhs_dir,
     const cprog_data<T> &rhs_dir,
     int level,
     std::vector<T> &path,
     const char *module_name, int module_index,
-    FILE *report)
+    FILE *report,
+    match_progress &progress)
 {
   if (level == 0) {
-    // 叶子节点：找到一条匹配链，直接写入文件
     if (report != nullptr) {
       emit_chain_line(report, module_name, module_index, path);
     }
@@ -139,99 +185,201 @@ size_t ccompare<T>::match_subtrees(
   auto &lhs_children = lhs_info.contents[child_level];
   auto &rhs_children = rhs_info.contents[child_level];
 
-  // 构建 rhs 子节点的 offset 索引：排序数组 + lower_bound
-  std::vector<std::pair<T, uint32_t>> rhs_sorted;
+  uint32_t lhs_start = lhs_dir.start;
+  uint32_t lhs_end = std::min(lhs_dir.end, static_cast<uint32_t>(lhs_children.size()));
+  uint32_t rhs_start = rhs_dir.start;
   uint32_t rhs_end = std::min(rhs_dir.end, static_cast<uint32_t>(rhs_children.size()));
-  if (rhs_end > rhs_dir.start) {
-    rhs_sorted.reserve(rhs_end - rhs_dir.start);
-    for (uint32_t i = rhs_dir.start; i < rhs_end; ++i) {
-      rhs_sorted.emplace_back(rhs_children[i].address - rhs_dir.value, i);
+
+  // level == 1 快速路径：子节点是叶子，直接计数，避免逐个递归到 level 0
+  if (level == 1) {
+    uint32_t li = lhs_start, ri = rhs_start;
+    size_t count = 0;
+
+    while (li < lhs_end && ri < rhs_end) {
+      T lhs_off = lhs_children[li].address - lhs_dir.value;
+      T rhs_off = rhs_children[ri].address - rhs_dir.value;
+
+      if (lhs_off < rhs_off) {
+        ++li;
+      } else if (lhs_off > rhs_off) {
+        ++ri;
+      } else {
+        // 找出两侧重复节点的范围
+        uint32_t lhs_dup_end = li + 1;
+        while (lhs_dup_end < lhs_end &&
+               lhs_children[lhs_dup_end].address - lhs_dir.value == lhs_off) {
+          ++lhs_dup_end;
+        }
+        uint32_t rhs_dup_end = ri + 1;
+        while (rhs_dup_end < rhs_end &&
+               rhs_children[rhs_dup_end].address - rhs_dir.value == lhs_off) {
+          ++rhs_dup_end;
+        }
+
+        size_t pairs = static_cast<size_t>(lhs_dup_end - li) *
+                       static_cast<size_t>(rhs_dup_end - ri);
+        if (report != nullptr) {
+          path.push_back(lhs_off);
+          for (size_t p = 0; p < pairs; ++p) {
+            emit_chain_line(report, module_name, module_index, path);
+          }
+          path.pop_back();
+        }
+        count += pairs;
+        progress.add(pairs);
+
+        li = lhs_dup_end;
+        ri = rhs_dup_end;
+      }
     }
-    std::sort(rhs_sorted.begin(), rhs_sorted.end(),
-              [](const auto &a, const auto &b) { return a.first < b.first; });
+    return count;
   }
 
+  // 通用路径：双指针归并 + 前缀和剪枝 + 递归
+  uint32_t li = lhs_start, ri = rhs_start;
   size_t count = 0;
 
-  for (uint32_t i = lhs_dir.start; i < lhs_dir.end && i < lhs_children.size(); ++i) {
-    T lhs_offset = lhs_children[i].address - lhs_dir.value;
+  while (li < lhs_end && ri < rhs_end) {
+    T lhs_off = lhs_children[li].address - lhs_dir.value;
+    T rhs_off = rhs_children[ri].address - rhs_dir.value;
 
-    // 二分查找匹配的 rhs 子节点
-    auto lo = std::lower_bound(
-        rhs_sorted.begin(), rhs_sorted.end(), lhs_offset,
-        [](const auto &elem, const T &val) { return elem.first < val; });
+    if (lhs_off < rhs_off) {
+      ++li;
+    } else if (lhs_off > rhs_off) {
+      ++ri;
+    } else {
+      uint32_t lhs_dup_end = li + 1;
+      while (lhs_dup_end < lhs_end &&
+             lhs_children[lhs_dup_end].address - lhs_dir.value == lhs_off) {
+        ++lhs_dup_end;
+      }
+      uint32_t rhs_dup_end = ri + 1;
+      while (rhs_dup_end < rhs_end &&
+             rhs_children[rhs_dup_end].address - rhs_dir.value == lhs_off) {
+        ++rhs_dup_end;
+      }
 
-    if (lo == rhs_sorted.end() || lo->first != lhs_offset) continue;
+      path.push_back(lhs_off);
+      for (uint32_t lx = li; lx < lhs_dup_end; ++lx) {
+        // 前缀和剪枝：跳过空分支
+        if (chains_of(lhs_prefix, lhs_children[lx], child_level) == 0) {
+          continue;
+        }
+        for (uint32_t rx = ri; rx < rhs_dup_end; ++rx) {
+          if (chains_of(rhs_prefix, rhs_children[rx], child_level) == 0) {
+            continue;
+          }
+          count += match_subtrees(
+              lhs_info, rhs_info,
+              lhs_prefix, rhs_prefix,
+              lhs_children[lx], rhs_children[rx],
+              child_level, path,
+              module_name, module_index,
+              report, progress);
+        }
+      }
+      path.pop_back();
 
-    path.push_back(lhs_offset);
-
-    for (auto it = lo; it != rhs_sorted.end() && it->first == lhs_offset; ++it) {
-      count += match_subtrees(
-          lhs_info, rhs_info,
-          lhs_children[i], rhs_children[it->second],
-          child_level, path,
-          module_name, module_index, report
-      );
+      li = lhs_dup_end;
+      ri = rhs_dup_end;
     }
-
-    path.pop_back();
   }
 
   return count;
 }
 
-// ============ 匹配模块根节点 ============
+// ============ 匹配模块根节点（双指针归并 + 前缀和剪枝） ============
 
 template <class T>
 size_t ccompare<T>::match_module_roots(
     const cprog_chain_info<T> &lhs_info,
     const cprog_chain_info<T> &rhs_info,
+    const prefix_sums_t &lhs_prefix,
+    const prefix_sums_t &rhs_prefix,
     const cprog_sym_integr<T> &lhs_sym,
     const cprog_sym_integr<T> &rhs_sym,
+    uint64_t lhs_chains, uint64_t rhs_chains,
     FILE *report)
 {
   if (lhs_sym.sym == nullptr || rhs_sym.sym == nullptr) return 0;
   if (lhs_sym.data.size() == 0 || rhs_sym.data.size() == 0) return 0;
 
-  size_t count = 0;
-
-  // 构建 rhs 根节点的 offset 索引：排序数组
-  std::vector<std::pair<T, size_t>> rhs_sorted;
-  rhs_sorted.reserve(rhs_sym.data.size());
-  for (size_t i = 0; i < rhs_sym.data.size(); ++i) {
-    rhs_sorted.emplace_back(rhs_sym.data[i].address - rhs_sym.sym->start, i);
-  }
-  std::sort(rhs_sorted.begin(), rhs_sorted.end(),
-            [](const auto &a, const auto &b) { return a.first < b.first; });
-
-  // 在循环外创建 path 并复用
   std::vector<T> path;
   path.reserve(lhs_sym.sym->level + 1);
+  const char *module_name = lhs_sym.sym->name;
+  int module_index = lhs_sym.sym->count;
+  int level = lhs_sym.sym->level;
 
   if (report != nullptr) {
     fprintf(report, "  保持不变的链:\n");
   }
 
-  for (size_t i = 0; i < lhs_sym.data.size(); ++i) {
-    T lhs_offset = lhs_sym.data[i].address - lhs_sym.sym->start;
+  printf("    根节点: 旧=%zu 新=%zu, 链数: 旧=%llu 新=%llu, 上界=%llu\n",
+         lhs_sym.data.size(), rhs_sym.data.size(),
+         static_cast<unsigned long long>(lhs_chains),
+         static_cast<unsigned long long>(rhs_chains),
+         static_cast<unsigned long long>(std::min(lhs_chains, rhs_chains)));
 
-    auto lo = std::lower_bound(
-        rhs_sorted.begin(), rhs_sorted.end(), lhs_offset,
-        [](const auto &elem, const T &val) { return elem.first < val; });
+  size_t lhs_total_roots = lhs_sym.data.size();
+  match_progress progress;
 
-    if (lo == rhs_sorted.end() || lo->first != lhs_offset) continue;
+  // 双指针归并：根节点按 address 排序 → offset (address - sym.start) 也有序
+  size_t li = 0, ri = 0;
+  size_t count = 0;
 
-    for (auto it = lo; it != rhs_sorted.end() && it->first == lhs_offset; ++it) {
-      path.clear();
-      path.push_back(lhs_offset);
+  while (li < lhs_sym.data.size() && ri < rhs_sym.data.size()) {
+    T lhs_off = lhs_sym.data[li].address - lhs_sym.sym->start;
+    T rhs_off = rhs_sym.data[ri].address - rhs_sym.sym->start;
 
-      count += match_subtrees(
-          lhs_info, rhs_info,
-          lhs_sym.data[i], rhs_sym.data[it->second],
-          lhs_sym.sym->level, path,
-          lhs_sym.sym->name, lhs_sym.sym->count, report
-      );
+    if (lhs_off < rhs_off) {
+      ++li;
+    } else if (lhs_off > rhs_off) {
+      ++ri;
+    } else {
+      // 找出两侧重复节点的范围
+      size_t lhs_dup_end = li + 1;
+      while (lhs_dup_end < lhs_sym.data.size() &&
+             lhs_sym.data[lhs_dup_end].address - lhs_sym.sym->start == lhs_off) {
+        ++lhs_dup_end;
+      }
+      size_t rhs_dup_end = ri + 1;
+      while (rhs_dup_end < rhs_sym.data.size() &&
+             rhs_sym.data[rhs_dup_end].address - rhs_sym.sym->start == lhs_off) {
+        ++rhs_dup_end;
+      }
+
+      // 交叉匹配所有重复对，用前缀和剪枝
+      for (size_t lx = li; lx < lhs_dup_end; ++lx) {
+        if (chains_of(lhs_prefix, lhs_sym.data[lx], level) == 0) {
+          continue;
+        }
+        for (size_t rx = ri; rx < rhs_dup_end; ++rx) {
+          if (chains_of(rhs_prefix, rhs_sym.data[rx], level) == 0) {
+            continue;
+          }
+          path.clear();
+          path.push_back(lhs_off);
+          count += match_subtrees(
+              lhs_info, rhs_info,
+              lhs_prefix, rhs_prefix,
+              lhs_sym.data[lx], rhs_sym.data[rx],
+              level, path,
+              module_name, module_index,
+              report, progress);
+        }
+      }
+
+      li = lhs_dup_end;
+      ri = rhs_dup_end;
     }
+  }
+
+  // 最终进度
+  if (progress.matched > 0) {
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - progress.timer).count();
+    printf("    根节点遍历完成: %zu/%zu, 匹配 %zu 条链, %.3fs\n",
+           std::min(li, lhs_total_roots), lhs_total_roots, count, elapsed);
   }
 
   return count;
@@ -262,56 +410,104 @@ bin_compare_result<T> ccompare<T>::compare_bin_files(
   validate_bin_file(rhs_file.get(), rhs_path);
 
   // 解析二进制数据（mmap，不展开链）
+  printf("[对比] 解析二进制数据...\n");
   auto lhs_info = this->parse_cprog_bin_data(lhs_file.get());
   auto rhs_info = this->parse_cprog_bin_data(rhs_file.get());
+  printf("  旧文件: %zu 个模块, %zu 层\n", lhs_info.syms.size(), lhs_info.contents.size());
+  printf("  新文件: %zu 个模块, %zu 层\n", rhs_info.syms.size(), rhs_info.contents.size());
 
   bin_compare_result<T> result;
 
-  // 统计链总数（在树上直接计算，不展开）
-  result.lhs_total = count_chains_in_tree(lhs_info);
-  result.rhs_total = count_chains_in_tree(rhs_info);
+  // 用前缀和统计链总数（O(N) 替代递归 O(total_chains)）
+  printf("[对比] 统计链数量...\n");
+  prefix_sums_t lhs_prefix, rhs_prefix;
+  result.lhs_total = count_chains_prefix_sum(lhs_info, "旧", lhs_prefix);
+  result.rhs_total = count_chains_prefix_sum(rhs_info, "新", rhs_prefix);
+  printf("  旧文件总计: %zu 条链\n", result.lhs_total);
+  printf("  新文件总计: %zu 条链\n", result.rhs_total);
 
-  // 构建 rhs 模块索引：(name, index) -> sym 指针
-  std::unordered_map<chain_module_key, const cprog_sym_integr<T>*, 
-                     chain_module_key_hash> rhs_module_map;
-  for (auto &sym : rhs_info.syms) {
-    if (sym.sym == nullptr) continue;
-    chain_module_key key(sym.sym->name, sym.sym->count);
-    rhs_module_map[key] = &sym;
+  // 构建 rhs 模块索引：(name, index) -> sym index
+  std::unordered_map<chain_module_key, size_t, chain_module_key_hash> rhs_module_map;
+  for (size_t i = 0; i < rhs_info.syms.size(); ++i) {
+    if (rhs_info.syms[i].sym == nullptr) continue;
+    chain_module_key key(rhs_info.syms[i].sym->name, rhs_info.syms[i].sym->count);
+    rhs_module_map[key] = i;
   }
 
   // 遍历 lhs 模块，在 rhs 中查找匹配
+  printf("[对比] 匹配模块...\n");
+  auto match_start = std::chrono::steady_clock::now();
   size_t total_common = 0;
-  for (auto &lhs_sym : lhs_info.syms) {
+  size_t module_count = lhs_info.syms.size();
+
+  for (size_t idx = 0; idx < lhs_info.syms.size(); ++idx) {
+    auto &lhs_sym = lhs_info.syms[idx];
     if (lhs_sym.sym == nullptr) continue;
 
     chain_module_key key(lhs_sym.sym->name, lhs_sym.sym->count);
     auto it = rhs_module_map.find(key);
     if (it == rhs_module_map.end()) continue;
 
-    const cprog_sym_integr<T> *rhs_sym = it->second;
+    size_t rhs_idx = it->second;
+
+    // 用前缀和计算该模块的链数量
+    int lhs_level = lhs_sym.sym->level;
+    int rhs_level = rhs_info.syms[rhs_idx].sym->level;
+    uint64_t lhs_chains = 0;
+    for (size_t i = 0; i < lhs_sym.data.size(); ++i) {
+      lhs_chains += chains_of(lhs_prefix, lhs_sym.data[i], lhs_level);
+    }
+    uint64_t rhs_chains = 0;
+    for (size_t i = 0; i < rhs_info.syms[rhs_idx].data.size(); ++i) {
+      rhs_chains += chains_of(rhs_prefix, rhs_info.syms[rhs_idx].data[i], rhs_level);
+    }
+
+    // 任一侧为 0 则跳过
+    if (lhs_chains == 0 || rhs_chains == 0) continue;
 
     if (report != nullptr) {
       fprintf(report, "模块: %s[%d]\n", lhs_sym.sym->name, lhs_sym.sym->count);
     }
 
-    // 在树上匹配根节点和子树，匹配链直接写入 report
+    printf("  [%zu/%zu] %s[%d] 开始匹配...\n",
+           idx + 1, module_count, lhs_sym.sym->name, lhs_sym.sym->count);
+
+    auto mod_start = std::chrono::steady_clock::now();
     size_t common_count = match_module_roots(
-        lhs_info, rhs_info, lhs_sym, *rhs_sym, report);
+        lhs_info, rhs_info,
+        lhs_prefix, rhs_prefix,
+        lhs_sym, rhs_info.syms[rhs_idx],
+        lhs_chains, rhs_chains,
+        report);
+
+    double mod_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - mod_start).count();
+    total_common += common_count;
 
     if (common_count > 0) {
+      printf("  [%zu/%zu] %s[%d]: %zu 条匹配链, 模块耗时 %.3fs, 累计 %zu 条\n",
+             idx + 1, module_count, lhs_sym.sym->name, lhs_sym.sym->count,
+             common_count, mod_elapsed, total_common);
       module_chain_diff<T> diff;
       diff.module_name = lhs_sym.sym->name;
       diff.module_index = lhs_sym.sym->count;
       diff.common_count = common_count;
       result.modules.push_back(std::move(diff));
-      total_common += common_count;
+    } else {
+      printf("  [%zu/%zu] %s[%d]: 无匹配, 模块耗时 %.3fs\n",
+             idx + 1, module_count, lhs_sym.sym->name, lhs_sym.sym->count,
+             mod_elapsed);
     }
 
     if (report != nullptr) {
       fprintf(report, "\n");
     }
   }
+
+  double match_elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - match_start).count();
+  printf("[对比] 匹配完成, 共 %zu 条匹配链, 匹配阶段耗时 %.3fs\n",
+         total_common, match_elapsed);
 
   result.unchanged = total_common;
   return result;
